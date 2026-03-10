@@ -1,4 +1,5 @@
 from typing import TypedDict, List
+from detekcja.kalman_tracker import KalmanTracker
 
 class Record(TypedDict):
     timestamp: int
@@ -15,11 +16,13 @@ class LightSource:
         
         self.x, self.y = x, y
         self.dx, self.dy = 0, 0
-        
+
         self.records = []
         self.match_score = 0.0
         self.confidence = 0.5
-        self.last_seen_ts = 0  # <--- DODANO
+        self.last_seen_ts = 0
+
+        self.kf = KalmanTracker(x,y)
 
     def add_record(self, record):
         MOVEMENT_THRESHOLD = 20 # Piksele: poniżej tej wartości ignorujemy ruch
