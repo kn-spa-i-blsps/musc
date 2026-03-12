@@ -1,158 +1,167 @@
 import cv2
 import numpy as np
 import time
-from light_source import LightSource
 from typing import List
-from kalman_tracker import KalmanTracker
+from normal_light import Light
+import random
+from scipy.optimize import linear_sum_assignment
 
-# --- PARAMETRY ---
+
+# paramtery
 MIN_RADIUS = 3
-RADIUS = 12
-MIN_DIST = 50
-INTENSITY = 230
-THRESHOLD = 180
-MIN_CONFIDENCE = 0.4
-AUTH = [True, False, True, False]
-FREQ = 24
-SIZE = 60
-DRIFT_COEF = 1
+INTENSITY = 250
+THRESHOLD = 245
+RADIUS = 20
+MIN_DIST = 200
 DETECTION_TIMEOUT = 1500
+MIN_CONFIDENCE = 0.4
 
-
-def video():
+def main():
     cap = cv2.VideoCapture(0)
-    # if not cap.isOpened():
-    #     print("no stream")
-    #     exit()
+    if not cap.isOpened():
+        print("no stream")
+        exit()
 
-    sources: List[LightSource] = []
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+    cap.set(cv2.CAP_PROP_EXPOSURE, 50)
+
+    sources: List[Light] = []
     start_time = time.time()
+    ids = set()
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        ts = int((time.time() - start_time) * 1000)
+        ts = int((time.time() - start_time) * 1000)  # timestamp w ms
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        height, width = gray.shape
 
         _, thresh = cv2.threshold(gray, THRESHOLD, 255, cv2.THRESH_BINARY)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
+        print(thresh)
+        # detekcja punktów świetlnych
         detected_points = []
         for c in contours:
             (x, y), r = cv2.minEnclosingCircle(c)
+            ix, iy = int(x), int(y)
             if MIN_RADIUS < r < RADIUS * 2.5:
-                if gray[int(y), int(x)] > INTENSITY:
-                    detected_points.append({'x': int(x), 'y': int(y)})
+                if 0 <= ix < width and 0 <= iy < height:
+                    if gray[iy, ix] > INTENSITY:
+                        detected_points.append({'x': ix, 'y': iy, 'r': r})
 
-        # tracking kalman filter
-        used_points = set()
+        # najpierw wykonujemy predykcję dla wysztskich świateł zidentyfikowanych wczesniej
+        # i liczymy ich dopuszczalne promienie
+        predictions = []
+        thresholds = []
         for s in sources:
-            # predykcja
-            pred_x, pred_y = s.kf.predict()
+            print(s)
+            pred_x, pred_y = s.kalman.predict()
+            print(f"predykcja{pred_x}, {pred_y}")
+            predictions.append((pred_x, pred_y))
 
-            # Pobieramy prędkość wyliczoną przez Kalmana dla dynamicznego dystansu
-            _, _, vel_x, vel_y = s.kf.get_state()
+            _, _, vel_x, vel_y = s.kalman.get_state()
             velocity = (vel_x ** 2 + vel_y ** 2) ** 0.5
-            dynamic_min_dist = max(MIN_DIST, velocity * 2.5)
+            # Dynamiczny próg (bramkowanie) dla każdego trackera osobno
+            thresholds.append(max(MIN_DIST, velocity * 2.5))
 
-            # Do logiki "kapsuły" używamy obecnej pozycji (ax, ay) i przewidzianej (bx, by)
-            ax, ay = s.x, s.y
-            bx, by = pred_x, pred_y
+        # budujemy macierz kosztów
+        # (dla każdego juz znalezionego punktu obliczamy jego odleglosc źródeł światła które teraz poznalismy)
+        num_trackers = len(sources)
+        num_detections = len(detected_points)
 
-            found_match = None
-            current_min_dist = dynamic_min_dist
-            match_idx = -1
+        cost_matrix = np.zeros((num_trackers, num_detections))
+        for t in range(num_trackers):
+            for d in range(num_detections):
+                pred_x, pred_y = predictions[t]
+                det_x, det_y = detected_points[d]['x'], detected_points[d]['y']
+                dist = ((det_x - pred_x) ** 2 + (det_y - pred_y) ** 2) ** 0.5
+                cost_matrix[t, d] = dist
 
-            # 2. SZUKANIE DOPASOWANIA
-            for i, p in enumerate(detected_points):
-                if i in used_points: continue
-                px, py = p['x'], p['y']
+        # odpalamy Algorytm Węgierski
+        # (znajduje globalnie optymalne dopasowanie)
+        if num_trackers > 0 and num_detections > 0:
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        else:
+            row_ind, col_ind = [], []
+        # linear_sum zwraca krotki dopasowan
+        # zbiory pomocnicze, żeby wiedzieć, kto został bez pary
+        unmatched_trackers = set(range(num_trackers))
+        unmatched_detections = set(range(num_detections))
 
-                dx, dy = bx - ax, by - ay
-                mag_sq = dx * dx + dy * dy
+        # sprawdzamy wyniki dopasowan
+        for t, d in zip(row_ind, col_ind):
+            # sprawdzamy czy dobrze to przypisało
+            if cost_matrix[t, d] <= thresholds[t]:
+                # jak tu weszlismy to znaczy że zidentyfikowalismy gdzie znajduje sie obecnie nasz wczesniejszy punkt
+                s = sources[t]
+                p = detected_points[d]
 
-                if mag_sq == 0:
-                    dist = ((px - ax) ** 2 + (py - ay) ** 2) ** 0.5
-                else:
-                    t = max(0, min(1, ((px - ax) * dx + (py - ay) * dy) / mag_sq))
-                    closest_x = ax + t * dx
-                    closest_y = ay + t * dy
-                    dist = ((px - closest_x) ** 2 + (py - closest_y) ** 2) ** 0.5
-
-                if dist < current_min_dist:
-                    current_min_dist = dist
-                    found_match = p
-                    match_idx = i
-
-            # 3. AKTUALIZACJA STANU
-            if found_match:
-                # Jeśli znaleźliśmy plamkę światła, korygujemy Kalmana pomiarem
-                s.kf.update(found_match['x'], found_match['y'])
+                # Aktualizacja Filtru (widzimy obiekt)
+                s.kalman.update(p['x'], p['y'])
                 s.last_seen_ts = ts
-                used_points.add(match_idx)
 
-            # Niezależnie od tego, czy znaleźliśmy punkt w tej klatce, czy nie:
-            # Aktualizujemy obiekt LightSource wygładzonymi danymi z Kalmana!
-            # Dzięki temu w przypadku braku detekcji przez 1-2 klatki, obiekt "pojedzie" siłą inercji.
-            kx, ky, kdx, kdy = s.kf.get_state()
-            s.x, s.y = kx, ky
-            s.dx, s.dy = kdx, kdy  # Nadpisujemy prędkość oryginalną tą stabilniejszą z Kalmana
+                kx, ky, kdx, kdy = s.kalman.get_state()
+                s.x, s.y, s.dx, s.dy = kx, ky, kdx, kdy
+                s.add_record({'timestamp': ts, 'state': True, 'x': p['x'], 'y': p['y']})
+                # Udało nam się go zidentyfikowaac
+                unmatched_trackers.remove(t)
+                unmatched_detections.remove(d)
 
-            if found_match:
-                s.add_record({'timestamp': ts, 'state': True, 'x': int(kx), 'y': int(ky)})
-            else:
-                s.add_record({'timestamp': ts, 'state': False, 'x': int(kx), 'y': int(ky)})
+        #jesli nie namiezylismy go to uatwaimy mu wspolrzedne gdzie "może" sie znajdować
+        for t in unmatched_trackers:
+            s = sources[t]
+            kx, ky, kdx, kdy = s.kalman.get_state()
+            s.x, s.y, s.dx, s.dy = kx, ky, kdx, kdy
+            s.add_record({'timestamp': ts, 'state': False, 'x': int(s.x), 'y': int(s.y)})
 
-        # --- DODAWANIE NOWYCH ---
-        for i, p in enumerate(detected_points):
-            if i not in used_points:
-                new_s = LightSource(SIZE, FREQ, AUTH, DRIFT_COEF, p['x'], p['y'])
-                new_s.last_seen_ts = ts
-                sources.append(new_s)
+        # dodawanie nowych punktów
+        for d in unmatched_detections:
+            p = detected_points[d]
+            while True:
+                new_ID = random.randint(0, 100)
+                if new_ID not in ids:
+                    ids.add(new_ID)
+                    break
 
-        # --- USUWANIE STARYCH ---
-        sources = [s for s in sources if (ts - s.last_seen_ts) < (DETECTION_TIMEOUT if s.match_score > 0.4 else 300)]
+            new_s = Light(new_ID, ts, p['x'] , p['y'])
+            sources.append(new_s)
 
-        # --- RYSOWANIE I DEBUG ---
+        sources = [s for s in sources if (ts - s.last_seen_ts) < 300]
+        helper_ids = {s.ID for s in sources}
+        print(helper_ids)
+        ids = helper_ids
+
         cv2.drawContours(frame, contours, -1, (200, 200, 200), 1)
 
         for s in sources:
             if s.confidence < 0.1:
                 continue
-
             is_auth = s.match_score > 0.75 and s.confidence > MIN_CONFIDENCE
             color = (0, 255, 0) if is_auth else (0, 0, 255)
-
-            # Korzystamy z uaktualnionych, wygładzonych danych
             cx, cy = int(s.x), int(s.y)
             bx, by = int(s.x + s.dx), int(s.y + s.dy)
 
             velocity = (s.dx ** 2 + s.dy ** 2) ** 0.5
             d_dist = int(max(MIN_DIST, velocity * 2.5))
 
-            # Rysujemy "korytarz" szukania (predykcję Kalmana)
             cv2.line(frame, (cx, cy), (bx, by), (0, 255, 255), 1)
             cv2.circle(frame, (cx, cy), d_dist, (0, 150, 150), 1)
             cv2.circle(frame, (bx, by), d_dist, (0, 255, 255), 1)
-
-            # Główne kółko (Wygładzona pozycja ze wskaźnika)
             cv2.circle(frame, (cx, cy), RADIUS, color, 2)
-
             q_bits = s.get_quantized_bits()
-            q_str = "".join(map(str, q_bits[-8:])) if q_bits else "0"
-            cv2.putText(frame, f"ID:{id(s) % 100} BITS:{q_str}", (cx - 40, cy - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                        (0, 255, 255), 1)
-            cv2.putText(frame, f"M:{s.match_score:.2f} V:{velocity:.1f}", (cx - 40, cy - 40), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, color, 1)
+            q_str = "".join(map(str, q_bits[-8:]))  # Ostatnie 8 bitów
+            cv2.putText(frame, f"ID:{s.ID} BITS:{q_str}", (cx - 40, cy - 60), 1, 0.7, (0, 255, 255), 1)
+            cv2.putText(frame, f"M:{s.match_score:.2f} V:{velocity:.1f}", (cx - 40, cy - 40), 1, 0.7, color, 1)
 
         cv2.imshow("Optical Auth Receiver", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
     cap.release()
     cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
-    video()
+    main()
