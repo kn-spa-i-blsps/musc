@@ -3,9 +3,9 @@ import numpy as np
 
 class KalmanTracker:
     def __init__(self, x, y):
-        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf = cv2.KalmanFilter(4, 2, 0)
 
-        # Macierz przejścia. Przemnozenie macierzy [x,y,dx,dy] daje nam maicerz [nowe_x,nowe_y,dx,dy]
+        # Macierz przejścia: [x, y, dx, dy] -> [x+dx, y+dy, dx, dy]
         self.kf.transitionMatrix = np.array([
             [1, 0, 1, 0],
             [0, 1, 0, 1],
@@ -13,20 +13,20 @@ class KalmanTracker:
             [0, 0, 0, 1]
         ], np.float32)
 
-        # Macierz pomiaru (mierzymy tylko pozycję x i y)
+        # Macierz pomiaru – mierzymy tylko x i y
         self.kf.measurementMatrix = np.array([
             [1, 0, 0, 0],
             [0, 1, 0, 0]
         ], np.float32)
 
-        # processNoiseCov - im mniejszy, tym gładszy ruch, ale wolniejsza reakcja na zmianę kierunku
+        # Szum procesu – im mniejszy, tym gładszy tor ruchu
         self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-        # measurementNoiseCov - im większy, tym mniej ufamy detekcji
+        # Szum pomiaru – im większy, tym mniej ufamy detekcji
         self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.0
         self.kf.errorCovPost = np.eye(4, dtype=np.float32)
 
-        # Inicjalizacja stanu początkowego
-        self.kf.statePost = np.array([[np.float32(x)], [np.float32(y)], [0.], [0.]])
+        # Stan początkowy
+        self.kf.statePost = np.array([[x], [y], [0], [0]], dtype=np.float32)
 
     def predict(self):
         predicted = self.kf.predict()
