@@ -41,7 +41,7 @@ def main():
         _, thresh = cv2.threshold(gray, THRESHOLD, 255, cv2.THRESH_BINARY)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         print(thresh)
-        # detekcja punktów świetlnych
+        # detekcja-szymon punktów świetlnych
         detected_points = []
         for c in contours:
             (x, y), r = cv2.minEnclosingCircle(c)

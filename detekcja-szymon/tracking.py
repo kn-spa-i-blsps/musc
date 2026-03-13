@@ -40,7 +40,6 @@ def main():
 
         _, thresh = cv2.threshold(gray, THRESHOLD, 255, cv2.THRESH_BINARY)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        print(thresh)
         # detekcja punktów świetlnych
         detected_points = []
         for c in contours:
@@ -56,9 +55,7 @@ def main():
         predictions = []
         thresholds = []
         for s in sources:
-            print(s)
             pred_x, pred_y = s.kalman.predict()
-            print(f"predykcja{pred_x}, {pred_y}")
             predictions.append((pred_x, pred_y))
 
             _, _, vel_x, vel_y = s.kalman.get_state()
@@ -130,7 +127,6 @@ def main():
 
         sources = [s for s in sources if (ts - s.last_seen_ts) < 300]
         helper_ids = {s.ID for s in sources}
-        print(helper_ids)
         ids = helper_ids
 
         cv2.drawContours(frame, contours, -1, (200, 200, 200), 1)
