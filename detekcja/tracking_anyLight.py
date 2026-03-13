@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import time
 from typing import List
-from zwykle_swiatlo import Light
+from normal_light import Light
 import random
 from scipy.optimize import linear_sum_assignment
 
@@ -12,17 +12,18 @@ MIN_RADIUS = 3
 INTENSITY = 250
 THRESHOLD = 245
 RADIUS = 20
-MIN_DIST = 100
-SIZE = 60
-DRIFT_COEF = 1
+MIN_DIST = 200
 DETECTION_TIMEOUT = 1500
-#auto.exposire
+MIN_CONFIDENCE = 0.4
 
 def main():
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("no stream")
         exit()
+
+    # cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+    # cap.set(cv2.CAP_PROP_EXPOSURE, 50)
 
     sources: List[Light] = []
     start_time = time.time()
@@ -103,7 +104,7 @@ def main():
 
                 kx, ky, kdx, kdy = s.kalman.get_state()
                 s.x, s.y, s.dx, s.dy = kx, ky, kdx, kdy
-
+                s.add_record({'timestamp': ts, 'state': True, 'x': p['x'], 'y': p['y']})
                 # Udało nam się go zidentyfikowaac
                 unmatched_trackers.remove(t)
                 unmatched_detections.remove(d)
@@ -113,6 +114,7 @@ def main():
             s = sources[t]
             kx, ky, kdx, kdy = s.kalman.get_state()
             s.x, s.y, s.dx, s.dy = kx, ky, kdx, kdy
+            s.add_record({'timestamp': ts, 'state': False, 'x': int(s.x), 'y': int(s.y)})
 
         # dodawanie nowych punktów
         for d in unmatched_detections:
@@ -134,7 +136,10 @@ def main():
         cv2.drawContours(frame, contours, -1, (200, 200, 200), 1)
 
         for s in sources:
-            color = (0, 255, 0)
+            if s.confidence < 0.1:
+                continue
+            is_auth = s.match_score > 0.75 and s.confidence > MIN_CONFIDENCE
+            color = (0, 255, 0) if is_auth else (0, 0, 255)
             cx, cy = int(s.x), int(s.y)
             bx, by = int(s.x + s.dx), int(s.y + s.dy)
 
@@ -145,7 +150,10 @@ def main():
             cv2.circle(frame, (cx, cy), d_dist, (0, 150, 150), 1)
             cv2.circle(frame, (bx, by), d_dist, (0, 255, 255), 1)
             cv2.circle(frame, (cx, cy), RADIUS, color, 2)
-            cv2.putText(frame, f"ID:{s.ID}", (cx - 40, cy - 60), 1, 0.7, (0, 255, 255), 1)
+            q_bits = s.get_quantized_bits()
+            q_str = "".join(map(str, q_bits[-8:]))  # Ostatnie 8 bitów
+            cv2.putText(frame, f"ID:{s.ID} BITS:{q_str}", (cx - 40, cy - 60), 1, 0.7, (0, 255, 255), 1)
+            cv2.putText(frame, f"M:{s.match_score:.2f} V:{velocity:.1f}", (cx - 40, cy - 40), 1, 0.7, color, 1)
 
         cv2.imshow("Optical Auth Receiver", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
