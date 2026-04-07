@@ -1,0 +1,600 @@
+Dokumentacja modułu SalomonReed
+
+1. Cel modułu
+
+Ten moduł implementuje uproszczony mechanizm kodowania i dekodowania danych z użyciem podejścia z rodziny Reed-Solomon.
+
+Jego zadanie jest proste:
+- encode(...) zamienia dane wejściowe na dłuższy kod z redundancją,
+- decode(...) próbuje odzyskać dane oryginalne nawet wtedy, gdy część zakodowanych danych została uszkodzona.
+
+To nie jest szyfrowanie.
+To jest kodowanie korekcyjne, czyli dodawanie nadmiarowych danych po to, aby możliwe było wykrywanie i poprawianie błędów.
+
+2. Co oznacza redundancja
+
+Redundancja to dodatkowa informacja dołączana do danych.
+
+Przykład intuicyjny:
+- masz dane: 10110111
+- po zakodowaniu dostajesz dłuższy ciąg bitów
+- ten dłuższy ciąg zawiera informacje potrzebne do odzyskania oryginału, jeśli transmisja lub zapis uszkodzi część danych
+
+Im większa redundancja:
+- tym dłuższy wynik,
+- ale tym większa odporność na błędy.
+
+W tej implementacji redundancja jest sterowana parametrem:
+
+redundancy
+
+Na jego podstawie wyliczana jest liczba symboli nadmiarowych.
+
+3. Ogólna idea działania
+
+3.1. Wejście
+
+Moduł przyjmuje dane jako string bitowy, czyli napis złożony wyłącznie z:
+- '0'
+- '1'
+
+Przykłady poprawnych danych:
+
+"10110111"
+"1010101010101010"
+"1111000011110000"
+
+Długość wejścia musi być wielokrotnością 8, ponieważ implementacja działa na bajtach.
+
+3.2. Symbol
+
+Kod Reed-Solomon działa na symbolach, nie bezpośrednio na pojedynczych bitach.
+
+W tej implementacji przyjęto:
+- 1 symbol = 1 bajt = 8 bitów
+
+To oznacza:
+- 8 bitów wejścia = 1 symbol danych
+- 16 bitów wejścia = 2 symbole danych
+- 24 bity wejścia = 3 symbole danych
+- 32 bity wejścia = 4 symbole danych
+
+3.3. Jak z danych powstaje kod
+
+Dane wejściowe są zamieniane na listę bajtów.
+Te bajty są traktowane jako współczynniki wielomianu:
+
+P(x) = c0 + c1*x + c2*x^2 + ...
+
+Następnie ten wielomian jest liczony w kolejnych punktach.
+
+Otrzymane wartości tworzą zakodowany ciąg symboli.
+
+To właśnie ten zakodowany ciąg zwraca metoda encode().
+
+3.4. Jak działa dekodowanie
+
+Podczas dekodowania:
+1. odebrany ciąg zamieniany jest na bajty,
+2. kod próbuje odtworzyć liczbę symboli danych i nadmiarowych,
+3. budowane są różne kandydaty wielomianu źródłowego,
+4. wybierany jest taki wielomian, który najlepiej pasuje do odebranych danych,
+5. jeśli liczba błędów nie przekracza zdolności korekcji, zwracane są oryginalne dane.
+
+4. Struktura modułu
+
+Moduł składa się z:
+- stałych i tablic do działań w GF(256),
+- funkcji pomocniczych,
+- wyjątku ReedSolomonDecodeError,
+- klasy SalomonReed.
+
+5. GF(256) — co to jest i po co tu występuje
+
+Reed-Solomon używa działań nie na zwykłych liczbach całkowitych, ale w tzw. ciele skończonym GF(256).
+
+W praktyce oznacza to, że:
+- każdy symbol to liczba od 0 do 255,
+- mnożenie i dzielenie nie działają tak jak w zwykłej arytmetyce,
+- operacje są zdefiniowane specjalnie pod kątem kodów korekcyjnych.
+
+Dla użytkownika modułu najważniejsze jest tylko to, że:
+- implementacja poprawnie wykonuje obliczenia potrzebne do Reed-Solomon,
+- nie trzeba ręcznie zajmować się matematyką GF(256).
+
+6. Opis wszystkich elementów kodu
+
+6.1. Stałe globalne
+
+PRIMITIVE_POLY
+
+PRIMITIVE_POLY = 0x11D
+
+To wielomian pierwotny używany do budowy ciała GF(256).
+
+Nie trzeba go zmieniać.
+
+GF_EXP i GF_LOG
+
+GF_EXP = [0] * 512
+GF_LOG = [0] * 256
+
+To tablice przyspieszające mnożenie i dzielenie w GF(256).
+
+Ich użycie pozwala uniknąć kosztownych obliczeń przy każdej operacji.
+
+Użytkownik klasy nie korzysta z nich bezpośrednio.
+
+6.2. Funkcje pomocnicze
+
+gf_mul(a, b)
+
+def gf_mul(a: int, b: int) -> int:
+
+Mnoży dwa elementy w GF(256).
+
+Parametry:
+- a — pierwszy symbol
+- b — drugi symbol
+
+Zwraca:
+- wynik mnożenia w GF(256)
+
+Uwagi:
+To nie jest zwykłe mnożenie liczb całkowitych.
+
+gf_div(a, b)
+
+def gf_div(a: int, b: int) -> int:
+
+Dzieli a przez b w GF(256).
+
+Parametry:
+- a — dzielna
+- b — dzielnik
+
+Zwraca:
+- wynik dzielenia w GF(256)
+
+Możliwy błąd:
+- ZeroDivisionError, jeśli b == 0
+
+poly_eval(coeffs, x)
+
+def poly_eval(coeffs: List[int], x: int) -> int:
+
+Oblicza wartość wielomianu w punkcie x.
+
+Jeżeli:
+
+coeffs = [c0, c1, c2]
+
+to liczony jest wielomian:
+
+P(x) = c0 + c1*x + c2*x^2
+
+w GF(256).
+
+Parametry:
+- coeffs — współczynniki wielomianu
+- x — punkt obliczenia
+
+Zwraca:
+- wartość wielomianu w GF(256)
+
+Znaczenie:
+To jedna z podstawowych funkcji używanych przez encode() i decode().
+
+solve_vandermonde(xs, ys, degree)
+
+def solve_vandermonde(xs: List[int], ys: List[int], degree: int) -> List[int]:
+
+Odtwarza współczynniki wielomianu na podstawie punktów, przez które ten wielomian przechodzi.
+
+Parametry:
+- xs — lista argumentów
+- ys — lista wartości wielomianu
+- degree — liczba współczynników do wyznaczenia
+
+Zwraca:
+- listę współczynników wielomianu
+
+Znaczenie:
+To kluczowa funkcja dekodowania.
+Na jej podstawie kod próbuje odtworzyć oryginalny wielomian danych.
+
+Możliwy błąd:
+- ValueError, gdy nie da się rozwiązać układu
+
+6.3. Wyjątek ReedSolomonDecodeError
+
+class ReedSolomonDecodeError(Exception):
+    pass
+
+Ten wyjątek oznacza, że dekodowanie się nie udało, ponieważ liczba błędów przekracza możliwości korekcji.
+
+Kiedy występuje:
+Najczęściej wtedy, gdy:
+- zakodowany ciąg został zbyt mocno uszkodzony,
+- redundancja jest za mała w stosunku do liczby błędów.
+
+7. Klasa SalomonReed
+
+To główna klasa modułu.
+
+7.1. Konstruktor
+
+def __init__(self, redundancy: float = 2.0) -> None:
+
+Tworzy obiekt kodeka i ustawia współczynnik redundancji.
+
+Parametry:
+- redundancy — współczynnik redundancji, domyślnie 2.0
+
+Przykład:
+
+codec = SalomonReed()
+
+albo:
+
+codec = SalomonReed(1.5)
+
+7.2. Metoda set()
+
+def set(self, redundancy: float) -> None:
+
+Ustawia redundancję.
+
+Parametry:
+- redundancy — liczba większa od 0
+
+Przykład:
+
+codec.set(2.0)
+
+Znaczenie:
+Ta wartość decyduje o:
+- długości zakodowanego sygnału,
+- liczbie symboli nadmiarowych,
+- liczbie błędów możliwych do poprawienia.
+
+Błąd:
+- ValueError, gdy redundancy <= 0
+
+7.3. Metoda parameters()
+
+def parameters(self, input_bits: int) -> Dict[str, float]:
+
+Zwraca parametry kodowania dla wiadomości o podanej długości.
+
+Parametr:
+- input_bits — długość wiadomości w bitach
+
+Zwraca:
+słownik z polami:
+- input_bits
+- data_symbols
+- parity_symbols
+- total_symbols
+- encoded_bits
+- code_rate
+- correctable_symbol_errors
+
+Znaczenie pól
+
+data_symbols
+Liczba symboli danych.
+
+parity_symbols
+Liczba symboli nadmiarowych.
+
+total_symbols
+Całkowita liczba symboli po zakodowaniu.
+
+encoded_bits
+Długość zakodowanego ciągu w bitach.
+
+code_rate
+Stosunek danych właściwych do całkowitej długości kodu:
+
+code_rate = k / n
+
+Im mniejszy code_rate, tym większy narzut ochronny.
+
+correctable_symbol_errors
+Maksymalna liczba błędnych symboli, które można poprawić.
+
+Przykład:
+
+codec = SalomonReed(2.0)
+params = codec.parameters(16)
+
+Przykładowy wynik:
+
+{
+    "input_bits": 16,
+    "data_symbols": 2,
+    "parity_symbols": 4,
+    "total_symbols": 6,
+    "encoded_bits": 48,
+    "code_rate": 0.3333333333333333,
+    "correctable_symbol_errors": 2,
+}
+
+Błędy:
+- ValueError, jeśli długość nie jest dodatnią wielokrotnością 8
+
+7.4. Metoda encode()
+
+def encode(self, bits: str) -> str:
+
+Koduje wejściowy string bitowy do postaci z redundancją.
+
+Parametr:
+- bits — string zawierający tylko 0 i 1, długość musi być wielokrotnością 8
+
+Zwraca:
+- zakodowany string bitowy
+
+Co robi krok po kroku
+1. zamienia wejście na listę bajtów,
+2. oblicza liczbę symboli danych i wynikową długość kodu,
+3. traktuje dane jako współczynniki wielomianu,
+4. liczy wartości wielomianu w kolejnych punktach,
+5. zamienia wynik z powrotem na string bitowy.
+
+Przykład:
+
+codec = SalomonReed(2.0)
+encoded = codec.encode("10110111")
+
+Uwaga
+Wynik nie ma postaci:
+
+oryginał + parzystość
+
+To pełny zakodowany blok utworzony przez ewaluację wielomianu.
+
+7.5. Metoda decode()
+
+def decode(self, bits: str) -> str:
+
+Próbuje odzyskać oryginalne dane z zakodowanego ciągu.
+
+Parametr:
+- bits — zakodowany string bitowy, potencjalnie z błędami
+
+Zwraca:
+- oryginalny string bitowy
+
+Co robi krok po kroku
+1. zamienia wejście na listę bajtów,
+2. ustala liczbę symboli danych i nadmiarowych,
+3. wylicza maksymalną liczbę poprawialnych błędów,
+4. sprawdza różne kombinacje punktów,
+5. próbuje odtworzyć wielomian źródłowy,
+6. wybiera najlepszy kandydat,
+7. jeśli liczba błędów mieści się w limicie, zwraca dane oryginalne.
+
+Przykład:
+
+codec = SalomonReed(2.0)
+encoded = codec.encode("10110111")
+decoded = codec.decode(encoded)
+
+Możliwe błędy
+- ValueError — zły format danych
+- ReedSolomonDecodeError — za dużo błędów do poprawienia
+
+8. Metody prywatne
+
+Te metody są używane wewnętrznie i zwykle nie powinny być wywoływane bezpośrednio.
+
+_sizes_from_k(k)
+
+def _sizes_from_k(self, k: int) -> tuple[int, int, int]:
+
+Na podstawie liczby symboli danych wylicza:
+- k — liczbę symboli danych,
+- p — liczbę symboli nadmiarowych,
+- n — liczbę wszystkich symboli.
+
+_infer_k_and_p_from_n(n)
+
+def _infer_k_and_p_from_n(self, n: int) -> tuple[int, int]:
+
+Na podstawie długości zakodowanego sygnału i redundancji próbuje odtworzyć:
+- liczbę symboli danych,
+- liczbę symboli nadmiarowych.
+
+To jest potrzebne podczas dekodowania.
+
+_bits_to_bytes(bits)
+
+def _bits_to_bytes(bits: str) -> List[int]:
+
+Zamienia string bitowy na listę bajtów.
+
+Przykład:
+
+"10110111" -> [183]
+"1010101010101010" -> [170, 170]
+
+_bytes_to_bits(data)
+
+def _bytes_to_bits(data: List[int]) -> str:
+
+Zamienia listę bajtów na string bitowy.
+
+Przykład:
+
+[183] -> "10110111"
+[170, 170] -> "1010101010101010"
+
+9. Jak liczona jest redundancja
+
+Załóżmy:
+- k — liczba symboli danych
+- r — współczynnik redundancji
+
+Wtedy liczba symboli nadmiarowych wynosi:
+
+p = ceil(r * k)
+
+Całkowita liczba symboli:
+
+n = k + p
+
+Długość wyniku w bitach:
+
+encoded_bits = 8 * n
+
+10. Jak liczyć zdolność korekcji
+
+Maksymalna liczba błędnych symboli możliwych do poprawienia wynosi:
+
+t = floor(p / 2)
+
+To znaczy:
+- 2 symbole nadmiarowe -> poprawa 1 błędnego symbolu
+- 4 symbole nadmiarowe -> poprawa 2 błędnych symboli
+- 6 symboli nadmiarowych -> poprawa 3 błędnych symboli
+
+Bardzo ważne:
+chodzi o symbole, czyli tutaj o bajty, a nie pojedyncze bity.
+
+11. Przykłady użycia
+
+11.1. Najprostsze kodowanie i dekodowanie
+
+codec = SalomonReed(2.0)
+
+original = "10110111"
+encoded = codec.encode(original)
+decoded = codec.decode(encoded)
+
+Po tym:
+- original zawiera dane wejściowe,
+- encoded zawiera zakodowaną wersję,
+- decoded powinno być równe original.
+
+11.2. Użycie z parameters()
+
+codec = SalomonReed(2.0)
+params = codec.parameters(16)
+
+To przydaje się, gdy chcesz wcześniej sprawdzić:
+- jak długi będzie zakodowany wynik,
+- ile będzie symboli ochronnych,
+- ile błędów można poprawić.
+
+11.3. Obsługa błędów w projekcie
+
+W większym projekcie dekodowanie warto opakować w try/except:
+
+codec = SalomonReed(2.0)
+
+try:
+    decoded = codec.decode(encoded_data)
+except ReedSolomonDecodeError:
+    ...
+except ValueError:
+    ...
+
+12. Jak włączyć ten moduł do większego projektu
+
+Jeśli zapiszesz kod np. jako:
+
+salomon_reed.py
+
+to możesz używać go tak:
+
+from salomon_reed import SalomonReed, ReedSolomonDecodeError
+
+codec = SalomonReed(2.0)
+
+data = "10110111"
+encoded = codec.encode(data)
+
+try:
+    decoded = codec.decode(encoded)
+except ReedSolomonDecodeError:
+    ...
+
+13. Ograniczenia tej implementacji
+
+To ważna część dokumentacji.
+
+1. Wejście musi być wielokrotnością 8 bitów
+Nie można przekazać np. 5 albo 13 bitów.
+
+2. Implementacja jest nastawiona na krótkie wiadomości
+Najbardziej sensowny zakres to 8-32 bity.
+
+3. Dekodowanie jest brute-force
+Kod sprawdza kombinacje punktów, co jest proste i czytelne, ale nieoptymalne dla dużych danych.
+
+4. To uproszczony wariant
+Dobrze nadaje się do zadań edukacyjnych i małych projektów, ale nie jest pełną przemysłową implementacją Reed-Solomon.
+
+5. Interfejs używa stringów bitowych
+Do większych systemów często wygodniejsze jest API oparte o bytes.
+
+14. Najczęstsze błędy użytkownika
+
+Błąd 1: wejście zawiera znaki inne niż 0 i 1
+
+codec.encode("10120111")
+
+To spowoduje ValueError.
+
+Błąd 2: długość wejścia nie jest wielokrotnością 8
+
+codec.encode("10101")
+
+To także spowoduje ValueError.
+
+Błąd 3: zbyt wiele błędów przy dekodowaniu
+
+Jeśli zakodowane dane zostały zbyt mocno uszkodzone, decode() rzuci:
+
+ReedSolomonDecodeError
+
+Błąd 4: użycie innej redundancji przy dekodowaniu niż przy kodowaniu
+
+Jeśli dane zakodowano przy jednej redundancji, a dekoduje się je przy innej, wynik może być błędny albo dekodowanie się nie powiedzie.
+
+15. Zalecany sposób użycia
+
+Najbezpieczniejszy schemat użycia w projekcie jest taki:
+
+codec = SalomonReed(2.0)
+
+source_bits = "10110111"
+encoded_bits = codec.encode(source_bits)
+
+try:
+    restored_bits = codec.decode(encoded_bits)
+except ReedSolomonDecodeError:
+    restored_bits = None
+
+To daje prosty i czytelny przepływ:
+- przygotowanie obiektu,
+- kodowanie,
+- dekodowanie,
+- obsługa błędu.
+
+16. Skrócony opis do dokumentacji projektu
+
+Możesz wkleić do projektu taki gotowy opis:
+
+Moduł SalomonReed implementuje uproszczony mechanizm kodowania i dekodowania danych z redundancją w oparciu o podejście Reed-Solomon nad GF(256). Dane wejściowe są podawane jako string bitowy o długości będącej wielokrotnością 8. Każdy bajt traktowany jest jako symbol, a ciąg symboli danych interpretowany jest jako współczynniki wielomianu. Kodowanie polega na wyznaczeniu wartości tego wielomianu w kolejnych punktach, a dekodowanie polega na odtworzeniu wielomianu na podstawie odebranych symboli i wybraniu rozwiązania najlepiej pasującego do danych. Liczba symboli nadmiarowych zależy od współczynnika redundancji redundancy, a maksymalna liczba poprawialnych błędnych symboli wynosi floor(parity_symbols / 2). Implementacja została przygotowana z myślą o krótkich danych i prostym użyciu w małych lub edukacyjnych projektach.
+
+17. Najkrótsza instrukcja użycia
+
+from salomon_reed import SalomonReed
+
+codec = SalomonReed(2.0)
+encoded = codec.encode("10110111")
+decoded = codec.decode(encoded)
+"""

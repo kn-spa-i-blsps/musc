@@ -1,0 +1,1 @@
+parametry sa akutalnie chyba rozwalone, reszta tak jak u szymonna powinna być tylko kod porozdzielany na osobne funkcje
