@@ -136,6 +136,7 @@ def update_sources(
     detected_points: list,
     ts: int,
     ids: set,
+    freq_lights: dict,
 ) -> tuple[list, set]:
     # dodawanie nowych punktów
     for d in unmatched_detections:
@@ -147,13 +148,23 @@ def update_sources(
                 ids.add(new_ID)
                 break
 
-        new_s = Light(new_ID, ts, p['x'], p['y'])
+        new_s = Light(new_ID, ts, p['x'], p['y'], freq_lights)
         sources.append(new_s)
 
-    sources = [s for s in sources if (ts - s.last_seen_ts) < TRACKER_MAX_AGE_MS]
-    ids = {s.ID for s in sources}
+    active_sources = []
+    for s in sources:
+        is_recent = (ts - s.last_seen_ts) < TRACKER_MAX_AGE_MS
 
-    return sources, ids
+        has_enough_history = len(s.records) >= 40
+
+        is_recognized = (s.drone_name != "Unknown") or (s.confidence > 0.2)
+
+        if is_recent and (not has_enough_history or is_recognized):
+            active_sources.append(s)
+
+    ids = {s.ID for s in active_sources}
+
+    return active_sources, ids
 
 
 def draw_overlay(frame: np.ndarray, sources: list, contours) -> None:
@@ -179,11 +190,17 @@ def draw_overlay(frame: np.ndarray, sources: list, contours) -> None:
 
         q_bits = s.get_quantized_bits()
         q_str = "".join(map(str, q_bits[-8:]))
+
+        name_label = f"{s.drone_name}: {s.FREQUENCY}Hz" if is_auth else "Unknown"
+        cv2.putText(frame, name_label, (cx - 40, cy - 80), 1, 0.7, color, 2)
+
         cv2.putText(frame, f"ID:{s.ID} BITS:{q_str}", (cx - 40, cy - 60), 1, 0.7, (0, 255, 255), 1)
         cv2.putText(frame, f"M:{s.match_score:.2f} V:{velocity:.1f}", (cx - 40, cy - 40), 1, 0.7, color, 1)
 
 
 def main():
+    # tu można wpisywać częstotliwości z jakimi będziemy rozpoznawać drony
+    freq_Lights = {"drone1": 12, "drone2": 15}
     cap = init_capture()
     sources: list = []
     ids: set = set()
@@ -200,7 +217,7 @@ def main():
         contours, detected_points = detect_lights(gray)
         cost_matrix, thresholds, _ = build_cost_matrix(sources, detected_points)
         _, unmatched_d = match_trackers(sources, detected_points, cost_matrix, thresholds, ts)
-        sources, ids = update_sources(sources, unmatched_d, detected_points, ts, ids)
+        sources, ids = update_sources(sources, unmatched_d, detected_points, ts, ids, freq_Lights)
         draw_overlay(frame, sources, contours)
 
         cv2.imshow("Optical Auth Receiver", frame)

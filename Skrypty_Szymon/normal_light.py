@@ -4,17 +4,18 @@ from kalman_tracker import KalmanTracker
 
 MOVEMENT_THRESHOLD = 20  # Piksele: poniżej tej wartości ignorujemy ruch (deadzone)
 
-
 class Light:
-    def __init__(self, ID: int, TS: int, x: float, y: float):
+    def __init__(self, ID: int, TS: int, x: float, y: float, freq_dict: dict):
         self.ID = ID # trzyma swoje id
         self.last_seen_ts = TS #uplyw czau od kiedy był ostatnio widziany
         self.x, self.y = x, y #wsporzedne
         self.dx, self.dy = 0, 0 # predkosc (chyba niepotrzebne)
         self.kalman = KalmanTracker(x, y) #predyckja gdzie będzie
 
+        self.freq_dict = freq_dict if freq_dict else {"default": 10}
+        self.FREQUENCY = list(self.freq_dict.values())[0]
+        self.drone_name = "Unknown"
         self.AUTH = [True, False, True, False]
-        self.FREQUENCY = 12
         self.SIZE = 60
         self.confidence = 0.5
         self.records = []
@@ -93,20 +94,35 @@ class Light:
         if len(self.records) < 10:
             return
 
-        bit_dur = 1000 / self.FREQUENCY
-        total_cycle = bit_dur * len(self.AUTH)
-        best_m = 0
+        best_overall_score = 0
+        best_freq = self.FREQUENCY
+        best_name = ''
+        for name, freq in self.freq_dict.items():
+            bit_dur = 1000 / self.FREQUENCY
+            total_cycle = bit_dur * len(self.AUTH)
+            best_m = 0
 
-        # Skanowanie fazy co 5ms (Cross-correlation)
-        for p in range(0, int(total_cycle), 5):
-            matches = sum(
-                1 for r in self.records
-                if r['state'] == self.AUTH[min(int(((r['timestamp'] + p) % total_cycle) / bit_dur), len(self.AUTH) - 1)]
-            )
-            score = matches / len(self.records)
-            if score > best_m:
-                best_m = score
+            # Skanowanie fazy co 5ms (Cross-correlation)
+            for p in range(0, int(total_cycle), 5):
+                matches = sum(
+                    1 for r in self.records
+                    if r['state'] == self.AUTH[min(int(((r['timestamp'] + p) % total_cycle) / bit_dur), len(self.AUTH) - 1)]
+                )
+                score = matches / len(self.records)
+                if score > best_m:
+                    best_m = score
 
-        self.match_score = best_m
-        # Płynna aktualizacja pewności
+            if best_m > best_overall_score:
+                best_overall_score = best_m
+                best_freq = freq
+                best_name = name
+
+        self.match_score = best_overall_score
+        if  (self.match_score > 0.75):
+            self.FREQUENCY = best_freq
+            self.drone_name = best_name
+        else:
+            self.drone_name = "Unknown"
+
         self.confidence = self.confidence * 0.8 + (self.match_score * 0.2)
+
