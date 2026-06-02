@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-from normal_light import Light
+from Skrypty_Szymon.normal_light import Light
 
 #Skrypt do oceny odległości (odl.py) połączony z wykrywaniem świateł
 
