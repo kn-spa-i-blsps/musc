@@ -1,0 +1,9 @@
+[project]
+name = "detection-tracking-solomon-scripts"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "opencv-python>=5.0.0.93",
+    "scipy>=1.18.0",
+    "scipy-stubs~=1.18.0",
+]
