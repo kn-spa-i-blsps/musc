@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stanowisko diod</title>
+<style>
+  body { background:#111; color:#ddd; font-family:system-ui, sans-serif; margin:12px; }
+  .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
+  #view { max-width:100%; width:888px; background:#000; border:1px solid #333; }
+  .panel { background:#1b1b1b; border:1px solid #333; border-radius:6px; padding:10px 12px; margin-bottom:10px; }
+  button { background:#2d5d8a; color:#fff; border:0; border-radius:4px; padding:6px 12px; cursor:pointer; font-size:14px; }
+  button.big { background:#2e7d32; font-size:18px; padding:10px 22px; }
+  button.grey { background:#444; }
+  button:disabled { opacity:.4; cursor:default; }
+  input, select { background:#222; color:#ddd; border:1px solid #444; border-radius:4px; padding:5px; }
+  #line { font-size:22px; font-weight:600; color:#ffd54f; margin:4px 0 8px; }
+  table { border-collapse:collapse; font-size:13px; }
+  td, th { border-bottom:1px solid #333; padding:4px 8px; text-align:left; white-space:nowrap; }
+  .ok { color:#81c784; } .bad { color:#e57373; } .dim { color:#888; }
+</style></head>
+<body>
+<div class="row">
+  <div>
+    <img id="view" src="/stream" alt="podgląd">
+    <div class="dim" id="viewinfo">Na żywo</div>
+  </div>
+  <div style="min-width:320px">
+    <div class="panel">
+      <div id="line">...</div>
+      <div>Nazwa: <input id="name" value="pokoj" size="12">
+        Dojście: <select id="lead"><option>5</option><option>10</option><option selected>15</option><option>20</option><option>30</option></select> s
+        Długość: <select id="dur"><option>10</option><option selected>15</option><option>20</option></select> s</div>
+      <div style="margin-top:8px"><button class="big" id="rec" onclick="record()">Nagraj</button>
+        <button class="grey" onclick="cancelRec()">Anuluj</button>
+        <button class="grey" onclick="testSound()">Test dźwięku</button></div>
+      <div class="dim" style="margin-top:6px">Po kliknięciu: dojście → <b>2 krótkie piknięcia</b> = start za 3 s →
+        nagranie → <b>długi niski dźwięk</b> = koniec. Wynik dekodera pojawi się niżej ok. 40 s później.</div>
+    </div>
+    <div class="panel">Podgląd: <span id="exps"></span>
+      <div class="dim">Nagrania zawsze z ekspozycją <span id="exprec"></span> µs.</div>
+      <div class="dim" id="meta"></div></div>
+    <div class="panel"><button class="grey" onclick="live()">Pokaż na żywo</button></div>
+  </div>
+</div>
+<div class="panel" style="margin-top:6px">
+  <b>Nagrania</b> <span class="dim">(na Pi w ~/recordings)</span>
+  <table id="recs"><thead><tr><th>nagranie</th><th>klatki / fps</th><th>odczyt ID</th><th>pierwsze ID</th>
+    <th>klatki z ID</th><th>fałszywe ID</th><th></th></tr></thead><tbody></tbody></table>
+</div>
+<script>
+let ctx = null;
+function audio() { if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)(); ctx.resume(); return ctx; }
+function beep(at, freq, len) {
+  const c = audio(), o = c.createOscillator(), g = c.createGain();
+  o.frequency.value = freq; o.type = "sine";
+  g.gain.setValueAtTime(0, at); g.gain.linearRampToValueAtTime(0.5, at + 0.01);
+  g.gain.setValueAtTime(0.5, at + len - 0.03); g.gain.linearRampToValueAtTime(0, at + len);
+  o.connect(g).connect(c.destination); o.start(at); o.stop(at + len + 0.05);
+}
+function signalStart(at) { beep(at, 1000, 0.15); beep(at + 0.3, 1000, 0.15); }   // za 3 s start
+function signalEnd(at) { beep(at, 440, 0.9); }                                    // koniec nagrania
+function testSound() { const t = audio().currentTime + 0.1; signalStart(t); signalEnd(t + 1.2); }
+
+async function record() {
+  const t0 = audio().currentTime;                 // dźwięki planujemy od razu - grają też przy karcie w tle
+  const q = new URLSearchParams({ lead: lead.value, dur: dur.value, name: document.getElementById("name").value });
+  const r = await fetch("/record?" + q, { method: "POST" });
+  const j = await r.json();
+  if (j.error) { alert(j.error); return; }
+  signalStart(t0 + j.beep1_in);
+  signalEnd(t0 + j.end_in);
+}
+async function cancelRec() { await fetch("/cancel", { method: "POST" }); if (ctx) { ctx.close(); ctx = null; } }
+async function del(name) {
+  if (!confirm("Usunąć nagranie " + name + " z Pi? Tego nie da się cofnąć.")) return;
+  const j = await (await fetch("/delete?name=" + encodeURIComponent(name), { method: "POST" })).json();
+  if (j.error) alert(j.error);
+}
+async function setExp(v) { await fetch("/exposure?us=" + v, { method: "POST" }); }
+function live() { view.src = "/stream?" + Date.now(); viewinfo.textContent = "Na żywo"; }
+function replay(name) { view.src = "/replay/" + name + "?" + Date.now(); viewinfo.textContent = "Odtwarzanie: " + name + " (z nakładką dekodera)"; }
+
+function row(e) {
+  const i = e.info || {}, r = e.result, p = e.progress;
+  let dec = '<span class="dim">czeka</span>', first = "", frac = "", wrong = "", btn = "";
+  if (r) {
+    dec = r.pierwsze_id_s === null ? '<span class="bad">brak ID</span>' : `<span class="ok">ID ${r.nadajnik_id}</span>`;
+    first = r.pierwsze_id_s === null ? "-" : r.pierwsze_id_s + " s";
+    frac = r.procent === null ? "-" : `${r.klatki_z_id_po_pierwszym[0]}/${r.klatki_z_id_po_pierwszym[1]} (${r.procent}%)`;
+    const w = Object.entries(r.falszywe_id || {});
+    wrong = w.length ? `<span class="bad">${w.map(([k, v]) => k + " (" + v + " kl.)").join(", ")}</span>` : '<span class="ok">brak</span>';
+    btn = `<button onclick="replay('${e.name}')">Odtwórz</button> ` +
+          `<a href="/download/${e.name}/wynik.mp4"><button class="grey" title="film z nakładką dekodera (H.264)">wynik .mp4</button></a> `;
+  } else if (p) {
+    dec = `liczy ${Math.round(100 * p.klatka / p.z)}%`;
+  }
+  if (i.frames) btn += `<a href="/download/${e.name}/raw.avi"><button class="grey" title="surowe nagranie MJPG (VLC)">surowe .avi</button></a> ` +
+                       `<a href="/download/${e.name}/paczka.zip"><button class="grey" title="raw.avi + ts.npy + info + wynik">paczka .zip</button></a> `;
+  btn += `<button class="grey" style="background:#7b2b2b" onclick="del('${e.name}')">usuń</button>`;
+  const fps = i.frames ? `${i.frames} / ${i.fps_measured}${i.gaps ? ' <span class="bad">luki ' + i.gaps + '</span>' : ''}` : "";
+  return `<tr><td>${e.name}</td><td>${fps}</td><td>${dec}</td><td>${first}</td><td>${frac}</td><td>${wrong}</td><td>${btn}</td></tr>`;
+}
+async function poll() {
+  try {
+    const s = await (await fetch("/status")).json();
+    line.textContent = s.line;
+    document.getElementById("rec").disabled = s.mode !== "idle";
+    exprec.textContent = s.exposure_rec;
+    meta.textContent = `nadajnik: ${s.arduino}  |  wolne miejsce: ${s.free_mb} MB`;
+    exps.innerHTML = ["auto", "4000", "1000", "250", "125"].map(v =>
+      `<button class="${v == s.preview_exp ? '' : 'grey'}" onclick="setExp('${v}')">${v}</button>`).join(" ");
+    document.querySelector("#recs tbody").innerHTML = s.recordings.map(row).join("");
+  } catch (e) { line.textContent = "brak połączenia z Pi"; }
+  setTimeout(poll, 700);
+}
+poll();
+</script>
+</body></html>

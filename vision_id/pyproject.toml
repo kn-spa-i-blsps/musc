@@ -1,0 +1,16 @@
+[project]
+name = "vision-id"
+version = "0.1.0"
+description = "Identyfikacja dronów po mruganiu diod (Manchester OOK) - bez ML"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.0",
+    "opencv-contrib-python>=4.10",
+    "pyserial>=3.5",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
