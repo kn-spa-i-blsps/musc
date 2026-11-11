@@ -24,9 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from detector import PRESETS, LedIdReceiver, ReceiverConfig  # noqa: E402
 from receiver import draw  # noqa: E402
 
-# kamera stoi na biurku: bez kompensacji ruchu kamery i bez przepływu optycznego
-# (na Pi razem ~26 ms/klatkę, a przy point_lock prawie nic nie dają)
-STATION = {"flow": False, "motion_comp": False}
+# kamera stoi na biurku: bez kompensacji ruchu kamery (na Pi ~10 ms/klatkę, a przy statywie nic nie daje)
+STATION = {"motion_comp": False}
 OUT_W = 666                     # szerokość filmu z nakładką
 GAMMA = np.array([min(255, int(255 * (i / 255) ** 0.45)) for i in range(256)], np.uint8)   # rozjaśnienie podglądu
 

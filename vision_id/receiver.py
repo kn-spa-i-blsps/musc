@@ -35,6 +35,8 @@ def draw_machine_view(frame, rx: LedIdReceiver) -> None:
     cv2.convertScaleAbs(frame, frame, alpha=0.35)   # przyciemnienie bez liczenia na float
     if rx.dbg_lit is not None and rx.dbg_lit.shape == frame.shape[:2]:
         frame[rx.dbg_lit] = (200, 100, 0)
+    if rx.dbg_sat is not None and rx.dbg_sat.shape == frame.shape[:2]:
+        frame[rx.dbg_sat] = (255, 0, 255)            # fioletowe = nasycone (sat_level)
     if rx.dbg_on is not None and rx.dbg_on.shape == frame.shape[:2]:
         frame[rx.dbg_on] = (0, 255, 0)
         frame[rx.dbg_off] = (0, 0, 255)
@@ -121,7 +123,7 @@ def draw(frame, rx: LedIdReceiver, drones, fps: float, debug: bool = False) -> N
                 f"  ({per_chip:.1f} klatek/chip)   [d] podglad maszyny",
                 (10, 22), cv2.FONT_HERSHEY_PLAIN, 1.2, (255, 255, 255), 1)
     if debug:
-        cv2.putText(frame, "niebieski=energia mrugania  zielony=jasnieje  czerwony=ciemnieje  kropki=szczyty  ramka=okno pomiaru",
+        cv2.putText(frame, "niebieski=energia  fiolet=nasycone  zielony=jasnieje  czerwony=ciemnieje  ramka=okno pomiaru",
                     (10, 64), cv2.FONT_HERSHEY_PLAIN, 1.0, (200, 200, 200), 1)
     if 0 < per_chip < 2.2:
         cv2.putText(frame, "ZA MALO KLATEK NA CHIP - zmniejsz HZ w Arduino",

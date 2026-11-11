@@ -9,7 +9,8 @@ firmware/led_beacon/codes.h          tablica kodów dla Arduino (z gen_codes.py)
 gen_codes.py                         generuje tablicę kodów (codebook.py + codes.h)
 codebook.py                          tablica kodów dla Pythona (z gen_codes.py)
 protocol.py                          dekoder: dopasowanie do wzorców kodów
-detector.py                          plamki (top-hat), śledzenie (Kalman), łączenie w drona, kąt
+detector.py                          energia mrugania, śledzenie torów, łączenie w drona, kąt
+tracking.py                          filtr Kalmana (stała prędkość) + algorytm węgierski do przydziału
 camera.py                            kamera w osobnym wątku (bez gubienia klatek)
 receiver.py                          odbiornik: kamera albo plik wideo, podgląd, zapis filmu
 verify_live.py                       test na żywo: kamera + Arduino na USB, "DETECTED: MATCHING ID"
@@ -123,13 +124,13 @@ pi/record.py, sweep.py         nagranie z wiersza poleceń / seria czasów naśw
 pi/focus.py, ard.py            ustawianie ostrości obiektywu / komendy dla nadajnika
 ```
 
-Na Pi do `~/vision` kopiujemy `pi/*` oraz `detector.py protocol.py codebook.py receiver.py camera.py`,
+Na Pi do `~/vision` kopiujemy `pi/*` oraz `detector.py tracking.py protocol.py codebook.py receiver.py camera.py`,
 potem `python3 station.py`. Kamerę może mieć tylko jeden program naraz.
 
 Ustawienia dekodera dla tej kamery: `--preset pi_niebo` (`detector.PRESETS`):
 - `led_color="nonblue"`: mapa max(R, G) - B - niebieskie niebo i białe ściany ~0, czerwona/zielona dioda jasna,
 - `proc_width=1332`: pełna rozdzielczość (dioda ma 2-3 px; po pomniejszeniu do 960 px ginie),
-- `point_lock` + `motion_model="cv"`: jak w UVDAR - tor przewiduje położenie (stała prędkość) i w każdej
+- `point_lock`: jak w UVDAR - tor przewiduje położenie (filtr Kalmana, stała prędkość) i w każdej
   klatce przeskakuje na jasny punkt diody obok; `signal="feat"`: sygnał z tego punktu w mapie koloru.
 
 Ocena nagrania: `uv run eval_rec.py NAGRANIE --id 5 --preset pi_niebo`
@@ -143,7 +144,7 @@ Wyniki z 2026-11-03 (ok. 2 m, ID 5, 20 Hz):
 | tło nieba, słabe diody / bokiem | 1.1 s | 55% (część czasu diod nie widać) | brak |
 | tło nieba, ręka w ruchu | 1.1 s | 88% | brak |
 
-Na Pi dekoder liczy ~29 kl/s (z `flow=False, motion_comp=False`), więc nagrania dekoduje po fakcie;
+Na Pi dekoder liczy ~29 kl/s (z `motion_comp=False`; pomiar sprzed zamiany przepływu optycznego na filtr Kalmana), więc nagrania dekoduje po fakcie;
 31 z 34 ms na klatkę to operacje na całym obrazie (mapa koloru, energia, szczyty) - do 60 fps na żywo
 trzeba je rozdzielić na rdzenie albo liczyć tylko w wycinkach.
 

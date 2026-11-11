@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 from codebook import CHIPS, CODES, MAX_DARK, MIN_DIST  # noqa: E402
 from protocol import N_IDS, TemplateDecoder, encode_frame  # noqa: E402
 from simulate import run  # noqa: E402
+from tracking import KalmanCV, hungarian  # noqa: E402
 
 
 def _rot(bits, r):
@@ -96,3 +97,33 @@ def test_junk_never_confirms_an_id():
 def test_end_to_end_video():
     res = run(fps=30, chip_hz=10, seconds=10, ids=[3, 17, 60, 120], seed=5, verbose=False)
     assert res["found"] == {3, 17, 60, 120} and not res["wrong"]
+
+
+def test_hungarian_is_optimal():
+    import itertools
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        n, m = (int(v) for v in rng.integers(1, 6, size=2))
+        c = rng.random((n, m)) * 10
+        pairs = hungarian(c)
+        assert len(pairs) == min(n, m)
+        assert len({r for r, _ in pairs}) == len(pairs) == len({k for _, k in pairs})
+        got = sum(c[r, k] for r, k in pairs)
+        if n <= m:
+            best = min(sum(c[i, p[i]] for i in range(n)) for p in itertools.permutations(range(m), n))
+        else:
+            best = min(sum(c[p[j], j] for j in range(m)) for p in itertools.permutations(range(n), m))
+        assert abs(got - best) < 1e-9
+
+
+def test_kalman_follows_constant_velocity_through_gaps():
+    kf = KalmanCV(100.0, 50.0, pos_std=3.0, accel=0.01)
+    vx, vy, dt = 0.5, -0.2, 16.7                       # px/ms, 60 fps
+    for k in range(1, 60):
+        kf.predict(dt)
+        if k % 4:                                       # co 4. klatka dioda zgaszona - bez pomiaru
+            kf.correct(100.0 + vx * k * dt, 50.0 + vy * k * dt, 2.0)
+    assert abs(kf.x[2] - vx) < 0.05 and abs(kf.x[3] - vy) < 0.05
+    for _ in range(3):                                   # 3 klatki bez pomiaru: przewidywanie
+        kf.predict(dt)
+    assert abs(kf.x[0] - (100.0 + vx * 62 * dt)) < 2.0

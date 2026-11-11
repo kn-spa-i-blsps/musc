@@ -9,13 +9,15 @@ Potok na klatkę:
      plakaty, twarz - zero; mrugająca dioda - najsilniejsze miejsce w obrazie
      (jej odblaski na płytce/dłoni też mrugają, ale słabiej).
      Kandydaci na diodę = lokalne szczyty energii.
-  4. śledzenie toru:
-     a) RUCH z przepływu optycznego (Lucas-Kanade) na teksturze wokół diody
-        (płytka, elektronika, palce) - tor jedzie razem z obiektem także wtedy,
-        gdy dioda jest zgaszona, a jej mruganie nie zaburza pomiaru ruchu
-     b) KOREKTA: łagodne przyciągnięcie do najsilniejszego szczytu energii tuż
-        obok (kilka px) - tor zostaje na samej diodzie, a nieruchoma dioda nie
-        "odpływa" na odblaski
+  4. śledzenie toru (tracking.py):
+     a) PRZEWIDYWANIE filtrem Kalmana (stała prędkość) - tor jedzie dalej
+        także wtedy, gdy dioda jest zgaszona (bit 0) albo wokół niej nie ma
+        tekstury (niebo, krótka ekspozycja)
+     b) PRZYDZIAŁ szczytów energii torom algorytmem węgierskim (minimalny
+        łączny koszt odległości od przewidywania, w bramce) - dwa tory blisko
+        siebie nie kradną sobie diod, jak przy wyborze zachłannym
+     c) KOREKTA Kalmana pomiarem: przydzielony szczyt energii (zgrubnie), potem
+        dokładniejsze położenie źródła (rdzeń / najjaśniejszy punkt), jeśli jest
   5. nowy tor na silnym szczycie energii, przy którym nie ma jeszcze toru
   6. sygnał toru = średnia jasność w oknie wokół diody (surowa - światło tylko
      dodaje jasności, więc zapalona jest zawsze jaśniejsza)
@@ -44,6 +46,7 @@ import cv2
 import numpy as np
 
 from protocol import DEFAULT_CHIP_HZ, FRAME_CHIPS, TemplateDecoder
+from tracking import KalmanCV, hungarian
 
 Peak = Tuple[float, float, float, float]          # x, y, promień, energia
 
@@ -60,10 +63,7 @@ class ReceiverConfig:
     feature: str = "max"             # jasność: "max" (max z B,G,R) albo "luma" (w testach gorsza)
     peak_nms_px: int = 11            # szczyty energii nie bliżej niż to
     snap_px: float = 8.0             # korekta tylko do szczytu bliżej niż to (+ promień diody)
-    snap_gain: float = 0.4           # jak mocno przyciągać do szczytu (0..1)
     min_track_sep_px: float = 15.0   # nowy tor nie bliżej niż to od istniejącego
-    flow_ring: Tuple[int, int] = (8, 45)   # punkty przepływu: pierścień wokół diody [px]
-    flow_points: int = 30
     lost_ms: float = 1000.0          # tor bez energii przez tyle -> zgubiony
     search_grow: float = 0.08        # zgubiony tor szuka szerzej: +px na każdą ms bez diody
     source_search_px: int = 35       # w tym promieniu tor szuka najjaśniejszego mrugającego punktu
@@ -87,21 +87,28 @@ class ReceiverConfig:
     signal: str = "gray"             # sygnał do dekodera: "gray" (luminancja - biały rdzeń i kolor) / "white" / "feat"
     core_drop: float = 15.0          # nie podawaj pozycji, gdy najjaśniejszy tor z ID jest o tyle ciemniejszy
                                      # niż źródło tego ID przed chwilą (zostały same odblaski); 0 = wył.
-    # ruch toru między klatkami: "flow" - tylko przepływ optyczny wokół diody;
-    # "cv" - dodatkowo stała prędkość z ostatnich położeń diody (jak HT4D w UVDAR:
-    # w krótkim oknie dioda jedzie po prostej), więc tor jedzie dalej, gdy dioda
-    # gaśnie albo gdy wokół niej nie ma tekstury (krótka ekspozycja, tło nieba)
-    motion_model: str = "flow"
-    cv_window_ms: float = 300.0      # z ilu ostatnich ms położeń liczymy prędkość
-    cv_max_gap_ms: float = 250.0     # dłużej bez diody -> tor przestaje jechać (stoi i szuka)
-    cv_max_px_per_ms: float = 2.0    # górna granica prędkości (2 px/ms = 33 px/klatkę przy 60 fps)
+    # ruch toru między klatkami: filtr Kalmana (stała prędkość, tracking.KalmanCV)
+    # + przydział szczytów energii algorytmem węgierskim (tracking.hungarian)
+    kf_accel: float = 0.01           # odchylenie przyspieszenia [px/ms^2] (szum procesu)
+    kf_peak_px: float = 4.0          # niepewność pomiaru = szczyt energii (rozmyty, z pamięcią) [px]
+    kf_fine_px: float = 1.0          # niepewność pomiaru = rdzeń / punkt diody [px]
+    kf_coast_ms: float = 250.0       # dłużej bez diody -> tor przestaje jechać (stoi i szuka)
+    max_px_per_ms: float = 2.0       # górna granica prędkości (2 px/ms = 33 px/klatkę przy 60 fps)
+    assign_energy_w: float = 0.3     # przydział: premia za silniejszy szczyt (0 = sama odległość)
+    kf_gate_sigma: float = 0.0       # bramka rośnie też o tyle odchyleń niepewności Kalmana (w symulacji 0 najlepsze)
     # jak w UVDAR: w każdej klatce dioda to JASNY PUNKT w mapie cechy (np. kolor nonblue),
     # tor przeskakuje na niego w oknie wokół przewidzianego położenia; bez tego tor
     # celuje w energię mrugania, która przy ruchu rozmazuje się w smugę
     point_lock: bool = False
     point_min: float = 20.0          # najsłabszy punkt, który jeszcze uznajemy za zapaloną diodę
     point_rel: float = 0.5           # ...i co najmniej taki ułamek jasności, jaką ta dioda już miała
-    flow: bool = True                # przepływ optyczny wokół diody (na Pi ~16 ms/klatkę; z point_lock zbędny?)
+    # NASYCENIE: zapalona dioda przepala matrycę (max(B,G,R) ~255), a ruch, szum i
+    # kompresja kamerki - nie. Tor powstaje tylko tam, gdzie niedawno było nasycenie,
+    # i znika, gdy go dawno nie było. 0 = wyłączone.
+    sat_level: float = 0.0           # od tej jasności piksel uznajemy za nasycony (np. 220)
+    sat_decay: float = 0.97          # pamięć nasycenia na klatkę (0.97 ~ 0.75 s do połowy przy 30 fps)
+    sat_spawn: float = 0.5           # nowy tor: pamięć nasycenia przy szczycie co najmniej tyle
+    sat_keep: float = 0.1            # tor znika, gdy pamięć nasycenia przy nim spadnie poniżej (~2.5 s)
 
     @property
     def chip_ms(self) -> float:
@@ -113,8 +120,11 @@ PRESETS: Dict[str, Dict[str, object]] = {
     # Pi 5 + IMX477 1332x990 @ 60 fps, ekspozycja ~250 us, kolorowe diody (czerwona/zielona)
     # na tle nieba, nadajnik w ruchu. Nagrania testowe 2026-11-03: nieruchome 100%,
     # ręka w ruchu ~88% klatek z ID, zero fałszywych ID.
-    "pi_niebo": dict(led_color="nonblue", proc_width=1332, motion_model="cv", point_lock=True,
+    "pi_niebo": dict(led_color="nonblue", proc_width=1332, point_lock=True,
                      snap_px=20.0, min_track_sep_px=30.0, core_lock=False, signal="feat", min_contrast=6.0),
+    # kamerka laptopa (30 fps, auto-ekspozycja, kompresja): dużo mrugającego szumu na
+    # ruchu i krawędziach - kandydaci tylko przy nasyconych (przepalonych) pikselach
+    "laptop": dict(sat_level=220.0, spawn_threshold=35.0),
 }
 
 
@@ -127,8 +137,7 @@ class LedTrack:
     last_seen_ts: float
     decoder: TemplateDecoder
     radius: float = 3.0
-    pts: Optional[np.ndarray] = None             # punkty przepływu (N x 1 x 2, float32)
-    pts_frame: int = 0                           # kiedy ostatnio odświeżone
+    kf: Optional[KalmanCV] = None                # położenie + prędkość (tracking.py)
     levels: Deque[float] = field(default_factory=lambda: deque(maxlen=90))
     states: Deque[int] = field(default_factory=lambda: deque(maxlen=90))
     lohi: Optional[Tuple[float, float]] = None   # poziomy "zgaszona"/"zapalona" (percentyle 10/90)
@@ -140,10 +149,6 @@ class LedTrack:
     on_peak: float = 0.0                         # jasność najjaśniejszego punktu toru, gdy dioda świeci
     synced_with: Optional[int] = None            # ID przejęte przez synchronizację z innym torem
     core: float = 0.0                            # jasność białego rdzenia, gdy świeci (źródło > odblask)
-    obs: Deque[Tuple[float, float, float]] = field(default_factory=lambda: deque(maxlen=40))  # (ts, x, y), gdy widać diodę
-    vx: float = 0.0                              # prędkość z obs [px/ms] (motion_model="cv")
-    vy: float = 0.0
-    flow_moved: bool = False                     # przepływ optyczny przesunął tor w tej klatce
     point_peak: float = 0.0                      # jasność punktu diody, gdy świeci (point_lock)
 
 
@@ -205,7 +210,6 @@ class LedIdReceiver:
         self.tracks: List[LedTrack] = []
         self._next_tid = 1
         self._frame_idx = 0
-        self._prev_gray: Optional[np.ndarray] = None       # do przepływu optycznego
         self._prev_small_gray: Optional[np.ndarray] = None  # do kompensacji ruchu
         self._prev_feat: Optional[np.ndarray] = None
         self._hann: Optional[np.ndarray] = None
@@ -215,11 +219,12 @@ class LedIdReceiver:
         self._lost: List[Tuple[float, float, float, int]] = []
         self._src_core: Dict[int, Tuple[float, float]] = {}   # ID -> (jasność rdzenia źródła, czas)
         self.energy: Optional[np.ndarray] = None
+        self.sat: Optional[np.ndarray] = None    # pamięć nasycenia (0..1), gdy sat_level > 0
         self.small: Optional[np.ndarray] = None
         self.last_events: List[Tuple[float, float, float, int]] = []   # szczyty energii (do podglądu)
         self.last_motion: Tuple[float, float] = (0.0, 0.0)
         self.debug = False                       # zapisuj maski do podglądu (dbg_*)
-        self.dbg_on = self.dbg_off = self.dbg_lit = None
+        self.dbg_on = self.dbg_off = self.dbg_lit = self.dbg_sat = None
 
     # ------------------------------------------------------------ ruch kamery
     def _compensate_motion(self, gray: np.ndarray) -> None:
@@ -241,7 +246,11 @@ class LedIdReceiver:
             self._prev_feat = cv2.warpAffine(self._prev_feat, m, (w, h), borderMode=cv2.BORDER_REPLICATE)
         if self.energy is not None:
             self.energy = cv2.warpAffine(self.energy, m, (w, h))
-        # tory przesuwa przepływ optyczny (zawiera już ruch kamery)
+        if self.sat is not None:
+            self.sat = cv2.warpAffine(self.sat, m, (w, h))
+        for t in self.tracks:
+            t.kf.shift(dx, dy)
+            t.x, t.y = float(t.kf.x[0]), float(t.kf.x[1])
 
     # -------------------------------------------------------- energia mrugania
     def _update_energy(self, feat: np.ndarray) -> None:
@@ -266,6 +275,22 @@ class LedIdReceiver:
                 diff = f - prev
                 self.dbg_on, self.dbg_off = diff > 25, diff < -25
         self._prev_feat = f
+
+    def _update_sat(self, img: np.ndarray) -> None:
+        """Pamięć nasycenia: 1 tam, gdzie teraz jest przepalone (z marginesem kilku px), potem powoli gaśnie."""
+        cfg = self.cfg
+        m = cv2.compare(brightness(img), cfg.sat_level, cv2.CMP_GE)
+        m = cv2.dilate(m, np.ones((7, 7), np.uint8))     # szczyt energii bywa obok przepalonego środka
+        cur = m.astype(np.float32) * (1.0 / 255.0)
+        self.sat = cur if self.sat is None or self.sat.shape != cur.shape else cv2.max(cur, self.sat * cfg.sat_decay)
+        if self.debug:
+            self.dbg_sat = m > 0
+
+    def _sat_at(self, x: float, y: float) -> float:
+        if self.sat is None:
+            return 1.0
+        h, w = self.sat.shape
+        return float(self.sat[min(max(int(round(y)), 0), h - 1), min(max(int(round(x)), 0), w - 1)])
 
     def _peaks(self) -> List[Peak]:
         """Lokalne szczyty energii mrugania: [(x, y, promień plamy, energia)], od najsilniejszego."""
@@ -303,86 +328,35 @@ class LedIdReceiver:
         peaks.sort(key=lambda p: -p[3])
         return peaks[:60]
 
-    # ---------------------------------------------------- przepływ optyczny
-    def _refresh_points(self, t: LedTrack, gray: np.ndarray) -> None:
-        """Punkty do przepływu: wyraźne narożniki w pierścieniu wokół diody (liczone tylko w wycinku)."""
-        cfg = self.cfg
-        if not cfg.flow:
-            t.pts = None
-            t.pts_frame = self._frame_idx
-            return
-        h, w = gray.shape
-        r_in, r_out = cfg.flow_ring
-        r_in = max(r_in, int(1.5 * t.radius))
-        cx, cy = int(round(t.x)), int(round(t.y))
-        x0, x1 = max(cx - r_out, 0), min(cx + r_out + 1, w)
-        y0, y1 = max(cy - r_out, 0), min(cy + r_out + 1, h)
-        t.pts_frame = self._frame_idx
-        if x1 - x0 < 8 or y1 - y0 < 8:
-            t.pts = None
-            return
-        mask = np.zeros((y1 - y0, x1 - x0), np.uint8)
-        cv2.circle(mask, (cx - x0, cy - y0), r_out, 255, -1)
-        cv2.circle(mask, (cx - x0, cy - y0), r_in, 0, -1)
-        if self.energy is not None:
-            mask[self.energy[y0:y1, x0:x1] >= cfg.energy_threshold] = 0   # mrugające piksele się nie nadają
-        pts = cv2.goodFeaturesToTrack(gray[y0:y1, x0:x1], cfg.flow_points, 0.01, 4, mask=mask)
-        t.pts = (pts + np.array([x0, y0], np.float32)).astype(np.float32) if pts is not None else None
-
-    def _flow(self, gray: np.ndarray) -> None:
-        """Przesuwa każdy tor o ruch tekstury wokół jego diody (Lucas-Kanade, z kontrolą w przód i w tył)."""
-        if self._prev_gray is None or not self.cfg.flow:
-            return
-        tracks = [t for t in self.tracks if t.pts is not None and len(t.pts) >= 3]
-        if not tracks:
-            return
-        allp = np.concatenate([t.pts for t in tracks])
-        lk = dict(winSize=(15, 15), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
-        nxt, st, _ = cv2.calcOpticalFlowPyrLK(self._prev_gray, gray, allp, None, **lk)
-        back, st2, _ = cv2.calcOpticalFlowPyrLK(gray, self._prev_gray, nxt, None, **lk)
-        good = (st[:, 0] == 1) & (st2[:, 0] == 1) & (np.linalg.norm((back - allp)[:, 0], axis=1) < 1.0)
-        gx, gy = self.last_motion
-        k = 0
-        for t in tracks:
-            n = len(t.pts)
-            g = good[k:k + n]
-            flow = (nxt[k:k + n] - t.pts)[:, 0][g]
-            new_pts = nxt[k:k + n][g]
-            k += n
-            if len(flow) < 3:
-                t.pts = new_pts if len(new_pts) else None
-                continue
-            # punkty tła (ściana za płytką) stoją, punkty obiektu się ruszają -
-            # jeśli wyraźna część punktów się rusza, bierzemy ruch tej części
-            rel = flow - np.array([gx, gy], np.float32)
-            moving = np.linalg.norm(rel, axis=1) > 0.7
-            sel = flow[moving] if moving.sum() >= max(3, 0.3 * len(flow)) else flow
-            dx, dy = np.median(sel, axis=0)
-            t.x += float(dx)
-            t.y += float(dy)
-            t.pts = new_pts
-            t.flow_moved = True
-
-    # ------------------------------------------------ ruch ze stałą prędkością
+    # ------------------------------------------------------- filtr Kalmana
     def _predict(self, ts: float, dt: float) -> None:
         """
-        motion_model="cv": tor, którego nie przesunął przepływ, jedzie dalej ze
-        swoją prędkością. Dioda w kodzie gaśnie na ~1 chip; bez tego szuka jej
-        tam, gdzie zgasła, a zapala się już kilkanaście px dalej -> nowy tor
-        i odczyt od zera.
+        Każdy tor jedzie do przewidzianego położenia. Dioda w kodzie gaśnie na
+        ~1 chip; bez przewidywania tor szukałby jej tam, gdzie zgasła, a ona
+        zapala się już kilkanaście px dalej -> nowy tor i odczyt od zera.
         """
-        if self.cfg.motion_model != "cv" or dt <= 0:
-            return
         for t in self.tracks:
-            if not t.flow_moved and ts - t.last_seen_ts < self.cfg.cv_max_gap_ms:
-                t.x += t.vx * dt
-                t.y += t.vy * dt
+            if ts - t.last_seen_ts >= self.cfg.kf_coast_ms:
+                t.kf.stop()
+            t.kf.predict(dt)
+            t.x, t.y = float(t.kf.x[0]), float(t.kf.x[1])
+
+    def _correct(self, t: LedTrack, zx: float, zy: float, meas_std: float) -> None:
+        t.kf.correct(zx, zy, meas_std)
+        t.kf.clamp_speed(self.cfg.max_px_per_ms)
+        t.x, t.y = float(t.kf.x[0]), float(t.kf.x[1])
+
+    def _reach(self, t: LedTrack, ts: float) -> float:
+        """Bramka: tor, który od jakiegoś czasu nie widzi diody (albo niepewny), szuka szerzej."""
+        cfg = self.cfg
+        grow = max(cfg.search_grow * (ts - t.last_seen_ts), cfg.kf_gate_sigma * t.kf.pos_std)
+        return cfg.snap_px + t.radius + min(grow, 60.0)
 
     def _lock_point(self, t: LedTrack, feat: np.ndarray, ts: float) -> None:
         """
         point_lock: najjaśniejszy punkt cechy w oknie wokół (przewidzianego) toru.
         Jasny = dioda świeci -> tor na środek punktu, tor "widział" diodę. Ciemno =
-        dioda zgaszona -> tor zostaje na przewidywaniu (motion_model="cv").
+        dioda zgaszona -> tor zostaje na przewidywaniu filtru Kalmana.
         """
         cfg = self.cfg
         h, w = feat.shape
@@ -403,51 +377,38 @@ class LedIdReceiver:
         t.y = y0 + float((ys * wts).sum() / wts.sum())
         t.last_seen_ts = ts
 
-    def _update_velocity(self, t: LedTrack, ts: float) -> None:
-        """Prędkość = prosta dopasowana do położeń diody z ostatnich cv_window_ms (najmniejsze kwadraty)."""
-        cfg = self.cfg
-        if t.last_seen_ts == ts:
-            t.obs.append((ts, t.x, t.y))
-        pts = [o for o in t.obs if ts - o[0] <= cfg.cv_window_ms]
-        if len(pts) < 3 or pts[-1][0] - pts[0][0] < 3 * self._frame_dt:
-            t.vx = t.vy = 0.0
-            return
-        a = np.array(pts)
-        tt = a[:, 0] - a[:, 0].mean()
-        den = float((tt * tt).sum())
-        vx = float((tt * (a[:, 1] - a[:, 1].mean())).sum() / den)
-        vy = float((tt * (a[:, 2] - a[:, 2].mean())).sum() / den)
-        sp = math.hypot(vx, vy)
-        if sp > cfg.cv_max_px_per_ms:
-            vx, vy = vx * cfg.cv_max_px_per_ms / sp, vy * cfg.cv_max_px_per_ms / sp
-        t.vx, t.vy = vx, vy
-
     # -------------------------------------------------------- dopasowanie
-    def _snap_and_spawn(self, peaks: List[Peak], ts: float, gray: np.ndarray) -> None:
+    def _assign_and_spawn(self, peaks: List[Peak], ts: float) -> None:
         cfg = self.cfg
         used = set()
-        # starsze tory wybierają pierwsze; każdy bierze najsilniejszy szczyt tuż obok
-        for t in sorted(self.tracks, key=lambda t: t.created_ts):
-            # tor, który od jakiegoś czasu nie widzi diody, szuka jej coraz szerzej
-            reach = cfg.snap_px + t.radius + min(cfg.search_grow * (ts - t.last_seen_ts), 60.0)
-            best = None
-            for pi, (px, py, pr, pe) in enumerate(peaks):
-                if pi in used or math.hypot(px - t.x, py - t.y) > reach:
-                    continue
-                if best is None or pe > peaks[best][3]:
-                    best = pi
-            if best is None:
-                continue
-            used.add(best)
-            px, py, pr, _ = peaks[best]
-            t.x += cfg.snap_gain * (px - t.x)
-            t.y += cfg.snap_gain * (py - t.y)
-            t.radius = 0.9 * t.radius + 0.1 * max(pr, 1.0)
-            t.last_seen_ts = ts
+        if self.tracks and peaks:
+            # koszt = (odległość od przewidywania / bramka)^2 - premia za siłę szczytu;
+            # poza bramką para zakazana. Algorytm węgierski: minimalny koszt łączny.
+            BIG = 1e6
+            tx = np.array([[t.x, t.y] for t in self.tracks])
+            reach = np.array([self._reach(t, ts) for t in self.tracks])
+            pk = np.array(peaks)
+            d = np.hypot(tx[:, None, 0] - pk[None, :, 0], tx[:, None, 1] - pk[None, :, 1])
+            gate = d <= reach[:, None]
+            emax = float(pk[:, 3].max())
+            cost = (d / reach[:, None]) ** 2 - cfg.assign_energy_w * (pk[None, :, 3] / emax)
+            cost = np.where(gate, cost, BIG)
+            if gate.any():
+                for ti, pi in hungarian(cost):
+                    if not gate[ti, pi]:
+                        continue
+                    used.add(pi)
+                    t = self.tracks[ti]
+                    px, py, pr, _ = peaks[pi]
+                    self._correct(t, px, py, cfg.kf_peak_px)
+                    t.radius = 0.9 * t.radius + 0.1 * max(pr, 1.0)
+                    t.last_seen_ts = ts
 
         for pi, (px, py, pr, pe) in enumerate(peaks):
             if pi in used or pe < cfg.spawn_threshold:
                 continue
+            if cfg.sat_level > 0 and self._sat_at(px, py) < cfg.sat_spawn:
+                continue                         # mruga, ale nigdy nie przepala matrycy - to nie dioda
             if any(math.hypot(px - t.x, py - t.y) < cfg.min_track_sep_px for t in self.tracks):
                 continue
             if len(self.tracks) >= cfg.max_tracks:
@@ -458,8 +419,8 @@ class LedIdReceiver:
                 self.tracks.remove(min(idle, key=lambda t: (t.contrast, -t.created_ts)))
             t = LedTrack(self._next_tid, px, py, ts, ts,
                          TemplateDecoder(cfg.chip_hz, min_contrast=cfg.min_contrast,
-                                         envelope=cfg.envelope), radius=max(pr, 2.0))
-            self._refresh_points(t, gray)
+                                         envelope=cfg.envelope), radius=max(pr, 2.0),
+                         kf=KalmanCV(px, py, pos_std=cfg.kf_peak_px, accel=cfg.kf_accel))
             self._inherit_id(t, ts)
             self.tracks.append(t)
             self._next_tid += 1
@@ -517,7 +478,7 @@ class LedIdReceiver:
         Źródło światła przepala matrycę do bieli (wszystkie kanały), odblask jest
         słabszy i zabarwiony. Gdy w okolicy toru jest rdzeń tak jasny jak ten,
         który ten tor już widział (dioda świeci), tor przeskakuje na jego środek -
-        trzyma się samej diody także w ruchu. Zgaszona dioda: tylko przepływ.
+        trzyma się samej diody także w ruchu. Zgaszona dioda: tylko przewidywanie.
         Okno jest małe, więc tor nie przeskakuje na INNY obiekt.
         """
         h, w = white.shape
@@ -622,30 +583,29 @@ class LedIdReceiver:
             self._frame_dt = 0.9 * self._frame_dt + 0.1 * dt
         if cfg.motion_comp:
             self._compensate_motion(gray)
-        for t in self.tracks:
-            t.flow_moved = False
-        self._flow(gray)
         self._predict(ts, dt)
         self._update_energy(feat)
+        if cfg.sat_level > 0:
+            self._update_sat(img)
         peaks = self._peaks()
         if roi is not None:
             x0, y0, x1, y1 = roi
             peaks = [p for p in peaks if x0 <= p[0] <= x1 and y0 <= p[1] <= y1]
         self.last_events = [(px, py, pr, 1) for px, py, pr, _ in peaks]
-        self._snap_and_spawn(peaks, ts, gray)
+        self._assign_and_spawn(peaks, ts)
 
         frame_ms = FRAME_CHIPS * cfg.chip_ms
         for t in self.tracks:
-            if t.pts is None or len(t.pts) < 6 or self._frame_idx - t.pts_frame >= 15:
-                self._refresh_points(t, gray)
+            # dokładne położenie źródła (jeśli widać) = drugi, pewniejszy pomiar dla Kalmana
+            x0, y0 = t.x, t.y
             if cfg.seek_source:
                 self._seek_source(t, feat)
             if cfg.core_lock:
                 self._lock_core(t, white)
             if cfg.point_lock:
                 self._lock_point(t, feat, ts)
-            if cfg.motion_model == "cv":
-                self._update_velocity(t, ts)
+            if (t.x, t.y) != (x0, y0):
+                self._correct(t, t.x, t.y, cfg.kf_fine_px)
             level = self._sample(t, {"white": white, "gray": gray}.get(cfg.signal, feat))
             t.states.append(int(t.lohi is not None and level > 0.5 * sum(t.lohi)))
             t.decoder.push(ts, level)
@@ -670,12 +630,12 @@ class LedIdReceiver:
                 t.drone_id, t.id_confirmed, t.inherited_ts = None, False, None
         if cfg.sync_adopt:
             self._adopt_synced_ids(ts)
-        self._prev_gray = gray
 
         H, W = feat.shape
         alive = []
         for t in self.tracks:
-            if ts - t.last_seen_ts < cfg.lost_ms and 0 <= t.x < W and 0 <= t.y < H and self._still_blinking(t, ts):
+            sat_ok = cfg.sat_level <= 0 or self._sat_at(t.x, t.y) >= cfg.sat_keep
+            if ts - t.last_seen_ts < cfg.lost_ms and 0 <= t.x < W and 0 <= t.y < H and self._still_blinking(t, ts) and sat_ok:
                 alive.append(t)
             elif t.drone_id is not None and t.id_confirmed:
                 self._lost.append((ts, t.x, t.y, t.drone_id))
