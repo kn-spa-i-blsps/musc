@@ -11,6 +11,8 @@ codebook.py                          tablica kodów dla Pythona (z gen_codes.py)
 protocol.py                          dekoder: dopasowanie do wzorców kodów
 detector.py                          energia mrugania, śledzenie torów, łączenie w drona, kąt
 tracking.py                          filtr Kalmana (stała prędkość) + algorytm węgierski do przydziału
+constellation.py                     konstelacje: grupowanie diod mrugających tym samym kodem, na bieżąco
+fc_telemetry.py                      telemetria z kontrolera lotu (MSP): żyroskop -> kompensacja ruchu kamery
 camera.py                            kamera w osobnym wątku (bez gubienia klatek)
 receiver.py                          odbiornik: kamera albo plik wideo, podgląd, zapis filmu
 verify_live.py                       test na żywo: kamera + Arduino na USB, "DETECTED: MATCHING ID"
@@ -63,7 +65,67 @@ pewnie ustalić. Tak każda widoczna dioda niesie pełne ID, a 4 diody to zapas.
    szarpnięcie nie gubi toru; nowy tor tylko na plamce, która właśnie się zapaliła,
 4. jasność plamki na torze → dekoder → ID wstępne / potwierdzone,
 5. tor, który się zgubił i zaraz odnalazł obok, przejmuje ID wstępnie,
-6. tory z tym samym ID = jeden dron; środek → azymut/elewacja.
+6. **konstelacje**: tory, które zapalają się i gasną w tych samych klatkach, łączymy w grupę
+   na bieżąco (niżej); tory grupy dzielą się ID,
+7. tory z tym samym ID = jeden dron; środek → azymut/elewacja.
+
+## Konstelacje (`constellation.py`)
+
+Diody jednego drona dostają ten sam sygnał, więc zmieniają stan w tych samych klatkach.
+Dla każdej pary torów zbieramy w każdej klatce dowody:
+
+- **za**: oba zapaliły się albo oba zgasły w tej samej klatce (waga 1) albo z przesunięciem
+  o 1 klatkę (waga 0.5 - klatka naświetlana na zboczu),
+- **przeciw**: jeden świeci, drugi jest zgaszony przez ≥ 2 klatki z rzędu → para zablokowana,
+  zebrane dowody „za" skasowane („to, co zgasło, i to, co dalej świeci, nie są w jednej grupie").
+
+Para łączy się po 2 wspólnych zdarzeniach (jedna wspólna „dziura" w świeceniu) utrzymanych
+przez 1 chip. Dowody wygasają z połową po jednym obiegu kodu. Grupa nigdy nie zawiera
+zablokowanej pary; numer grupy jest trwały. Do tego:
+
+- tor bez własnego odczytu dostaje ID swojej grupy,
+- **2 tory grupy z tym samym ID wstępnym = ID potwierdzone od razu** (`cs_confirm_votes`),
+  bez czekania pół obiegu kodu na drugi odczyt,
+- dwa tory grupy z różnymi potwierdzonymi ID → grupa jest rozdzielana.
+
+`rx.constellations` zawiera też grupy jeszcze bez ID (`drone_id=None`); w podglądzie to linie
+między diodami i podpis `K3 (4)` = grupa 3, 4 diody.
+
+Symulacja (4 drony × 4 diody, 30 i 60 fps, 20 losowań = 160 dronów):
+
+| | bez konstelacji | z konstelacjami |
+|---|---|---|
+| diody drona w jednej grupie | - | po 0.96 s (160/160) |
+| pierwsze ID (wstępne) | 2.27 s | 2.34 s |
+| ID potwierdzone | 3.48 s | 2.73 s |
+| odczytane drony / fałszywe ID wstępne / fałszywe potwierdzone | 155 / 15 / 0 | 155 / 12 / 0 |
+
+Ok. 4% klatek-grup zawiera diody dwóch dronów: w większości to diody, które nakładają się
+w obrazie; reszta to przypadkowo zgodne mruganie przez kilka klatek (rozdziela się samo).
+
+## Ruch własnej kamery: żyroskop kontrolera lotu (`fc_telemetry.py`)
+
+Kontroler (Mamba F722 MK4, Betaflight/INAV) oddaje po MSP prędkości kątowe z żyroskopu.
+Całkujemy je między czasami dwóch klatek i przesuwamy tory, energię mrugania i poprzednią
+klatkę o homografię obrotu - bez patrzenia na obraz, więc działa też na tle nieba.
+
+```bash
+uv run fc_telemetry.py --port /dev/ttyACM0                # czy FC odpowiada, ile Hz
+uv run fc_telemetry.py --port /dev/ttyACM0 --calibrate    # znaki osi i opóźnienie -> --fc-signs, --fc-latency
+uv run receiver.py --fc /dev/ttyACM0 --fc-tilt 20 --fc-signs=+++ --fc-latency 0
+```
+
+W swoim kodzie: `rx.process(frame, ts, cam_rot=fc.rotation(ts_poprzedniej, ts))`.
+Bez `cam_rot` (albo gdy telemetria zamilknie) zostaje kompensacja z obrazu (korelacja fazowa).
+
+Symulacja z kamerą obracającą się ±3° (8 losowań, 32 drony): bez kompensacji 8/32 dronów,
+z obrazu 31/32, z żyroskopu 31/32. Na syntetycznym obrazie obie metody są więc równie dobre;
+żyroskop ma pomóc tam, gdzie obraz nie ma punktów zaczepienia. **Na prawdziwym FC nie było
+to uruchamiane** - znaki osi, opóźnienie i częstotliwość odpytywania trzeba sprawdzić `--calibrate`.
+
+Akcelerometr nie przesuwa torów: przesunięcie kamery o centymetry prawie nie zmienia obrazu
+odległej diody, a położenie z całkowania przyspieszeń odpływa. Orientacja liczona przez FC
+(z akcelerometru i żyroskopu) jest dostępna jako `FcTelemetry.attitude`.
 
 ## Co zrobić krok po kroku
 
@@ -124,7 +186,7 @@ pi/record.py, sweep.py         nagranie z wiersza poleceń / seria czasów naśw
 pi/focus.py, ard.py            ustawianie ostrości obiektywu / komendy dla nadajnika
 ```
 
-Na Pi do `~/vision` kopiujemy `pi/*` oraz `detector.py tracking.py protocol.py codebook.py receiver.py camera.py`,
+Na Pi do `~/vision` kopiujemy `pi/*` oraz `detector.py tracking.py constellation.py fc_telemetry.py protocol.py codebook.py receiver.py camera.py`,
 potem `python3 station.py`. Kamerę może mieć tylko jeden program naraz.
 
 Ustawienia dekodera dla tej kamery: `--preset pi_niebo` (`detector.PRESETS`):

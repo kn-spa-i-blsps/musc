@@ -30,6 +30,7 @@ ap.add_argument("--sensor", default="1332x990", help="tryb sensora (1332x990 do 
 ap.add_argument("--lead", type=float, default=0, help="dodatkowe sekundy przed odliczaniem (czas na dojście)")
 ap.add_argument("--countdown", type=float, default=0, help="ile sekund po sygnale ODLICZANIE zaczyna się nagranie")
 ap.add_argument("--arduino", default="RUN", help="komenda dla nadajnika przed nagraniem ('' = nie ruszaj)")
+ap.add_argument("--rot", type=int, default=180, choices=[0, 180], help="obrót obrazu: 180 = kamera zamontowana do góry nogami, 0 = bez obrotu")
 args = ap.parse_args()
 if args.seconds > 20:
     raise SystemExit("Najwyżej 20 s (klatki są w RAM)")
@@ -52,7 +53,7 @@ frame_us = int(1e6 / args.fps)
 cam.configure(cam.create_video_configuration(
     main={"size": (w, h), "format": "RGB888"},
     sensor={"output_size": (sw, sh), "bit_depth": 10 if (sw, sh) == (1332, 990) else 12},
-    transform=Transform(hflip=1, vflip=1), buffer_count=8,
+    transform=Transform(hflip=int(args.rot == 180), vflip=int(args.rot == 180)), buffer_count=8,
     controls={"FrameDurationLimits": (frame_us, frame_us), "AeEnable": False, "AwbEnable": False,
               "ExposureTime": args.exposure, "AnalogueGain": args.gain, "ColourGains": (2.0, 2.0)}))
 cam.start()

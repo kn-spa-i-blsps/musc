@@ -4,7 +4,8 @@ o tym samym ID w drona (z kątem namiaru z kamery). Zero ML - OpenCV + numpy.
 
 Potok na klatkę:
   1. pomniejszenie do ~960 px szerokości
-  2. kompensacja ruchu kamery (korelacja fazowa) - przesuwamy historię i tory
+  2. kompensacja ruchu kamery - przesuwamy historię i tory: z żyroskopu kontrolera
+     lotu (process(cam_rot=...), fc_telemetry.py), a bez niego z obrazu (korelacja fazowa)
   3. ENERGIA MRUGANIA: |zmiana jasności piksela| z pamięcią ~1 s. Ściana,
      plakaty, twarz - zero; mrugająca dioda - najsilniejsze miejsce w obrazie
      (jej odblaski na płytce/dłoni też mrugają, ale słabiej).
@@ -24,6 +25,9 @@ Potok na klatkę:
   7. TemplateDecoder (protocol.py): dopasowanie do wszystkich kodów i faz ->
      najpierw ID wstępne ("DRON 5?"), po 2 zgodnych dopasowaniach potwierdzone;
      ID wygasa, gdy dekoder przestaje je potwierdzać
+  7a. KONSTELACJE (constellation.py): tory, które zapalają się i gasną w tych
+     samych klatkach, łączymy w grupę na bieżąco (po ~1 s, przed odczytem ID);
+     tory grupy dzielą się ID, a 2 zgodne odczyty w grupie potwierdzają je od razu
   8. tory z tym samym ID = jeden dron; pozycja z najsilniejszych źródeł
      (sama dioda, nie jej odblaski) -> azymut/elewacja
 
@@ -45,6 +49,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from constellation import BlinkGrouper
 from protocol import DEFAULT_CHIP_HZ, FRAME_CHIPS, TemplateDecoder
 from tracking import KalmanCV, hungarian
 
@@ -67,10 +72,20 @@ class ReceiverConfig:
     lost_ms: float = 1000.0          # tor bez energii przez tyle -> zgubiony
     search_grow: float = 0.08        # zgubiony tor szuka szerzej: +px na każdą ms bez diody
     source_search_px: int = 35       # w tym promieniu tor szuka najjaśniejszego mrugającego punktu
-    sync_corr: float = 0.85          # tory mrugające tak zgodnie = to samo źródło światła
+    sync_corr: float = 0.85          # (stare, gdy constellations=False) tory mrugające tak zgodnie = to samo źródło
     seek_source: bool = True         # przesuwaj tor na najjaśniejszy mrugający punkt w okolicy
     source_margin: float = 40.0      # o ile jaśniejszy musi być punkt obok, żeby tor tam przeszedł
-    sync_adopt: bool = True          # tor zsynchronizowany z torem z ID przejmuje to ID
+    sync_adopt: bool = True          # (stare, gdy constellations=False) tor zsynchronizowany z torem z ID przejmuje to ID
+    # KONSTELACJE (constellation.py): tory mrugające tym samym kodem łączymy w grupę
+    # na bieżąco - po pierwszym wspólnym zgaśnięciu i zapaleniu, bez czekania na ID
+    constellations: bool = True
+    cs_min_events: float = 2.0       # ile wspólnych zdarzeń (zapalenie / zgaśnięcie) łączy dwa tory
+    cs_near_weight: float = 0.5      # waga wspólnego zdarzenia przesuniętego o 1 klatkę
+    cs_margin: float = 0.3           # stan pewny, gdy jasność jest dalej niż tyle od progu (w skali -1..1)
+    cs_pool: bool = False            # wspólny dekoder grupy na średnim sygnale jej torów (w symulacji nic nie
+                                     # daje, a kosztuje ~20% czasu - zostaje jako opcja na słabe, zaszumione diody)
+    cs_confirm_votes: int = 2        # tyle torów grupy z tym samym ID wstępnym = ID potwierdzone od razu
+                                     # (niezależne odczyty zamiast czekania pół obiegu kodu); 0 = wył.
     sample_pad: int = 3              # okno sygnału: promień diody + tyle px
     sample_max: int = 12             # ...ale najwyżej tyle
     min_contrast: float = 12.0       # różnica jasności on/off w oknie; poniżej - tor "nie mruga"
@@ -150,6 +165,8 @@ class LedTrack:
     synced_with: Optional[int] = None            # ID przejęte przez synchronizację z innym torem
     core: float = 0.0                            # jasność białego rdzenia, gdy świeci (źródło > odblask)
     point_peak: float = 0.0                      # jasność punktu diody, gdy świeci (point_lock)
+    gid: Optional[int] = None                    # numer konstelacji (grupy torów mrugających tym samym kodem)
+    cs_state: int = 0                            # +1 świeci / -1 zgaszona / 0 nie wiadomo (dla konstelacji)
 
 
 @dataclass
@@ -163,6 +180,18 @@ class DroneObs:
     spread_px: float                 # rozpiętość konstelacji (do zgrubnej odległości)
     track_ids: List[int]
     confirmed: bool = True           # False = ID wstępne (1 dopasowanie albo przejęte po zgubieniu)
+
+
+@dataclass
+class Constellation:
+    """Grupa torów mrugających tym samym kodem = kandydat na drona, zanim znamy ID."""
+    gid: int
+    track_ids: List[int]
+    x: float                         # środek torów grupy [px obrazu pomniejszonego]
+    y: float
+    since_ts: float                  # od kiedy grupa ma >= 2 tory
+    drone_id: Optional[int] = None
+    confirmed: bool = False
 
 
 def fresh_ok(dec: TemplateDecoder, ts: float, frame_ms: float) -> bool:
@@ -225,8 +254,49 @@ class LedIdReceiver:
         self.last_motion: Tuple[float, float] = (0.0, 0.0)
         self.debug = False                       # zapisuj maski do podglądu (dbg_*)
         self.dbg_on = self.dbg_off = self.dbg_lit = self.dbg_sat = None
+        self.grouper = BlinkGrouper(FRAME_CHIPS * self.cfg.chip_ms, self.cfg.chip_ms,
+                                    min_events=self.cfg.cs_min_events, radius_px=self.cfg.group_radius_px,
+                                    near_weight=self.cfg.cs_near_weight)
+        self.constellations: List[Constellation] = []      # grupy z >= 2 torami (także bez ID)
+        self._gdec: Dict[int, TemplateDecoder] = {}        # gid -> wspólny dekoder grupy
+        self._gsince: Dict[int, float] = {}                # gid -> od kiedy grupa ma >= 2 tory
 
     # ------------------------------------------------------------ ruch kamery
+    def _compensate_rotation(self, shape: Tuple[int, int], cam_rot: np.ndarray) -> None:
+        """
+        Kamera obróciła się o wektor cam_rot [rad] (z żyroskopu kontrolera lotu,
+        fc_telemetry.py): nieruchomy punkt sceny przesuwa się w obrazie o
+        homografię H = K R^T K^-1 - niezależnie od odległości, bez patrzenia na
+        obraz (działa też na tle nieba, gdzie korelacja fazowa nie ma czego złapać).
+        Przesuwamy tak samo historię obrazu, energię mrugania i tory.
+        """
+        h, w = shape
+        fx = (w / 2) / math.tan(math.radians(self.cfg.hfov_deg) / 2)
+        K = np.array([[fx, 0.0, w / 2], [0.0, fx, h / 2], [0.0, 0.0, 1.0]])
+        R, _ = cv2.Rodrigues(np.asarray(cam_rot, dtype=np.float64).reshape(3, 1))
+        H = K @ R.T @ np.linalg.inv(K)
+        corners = np.array([[0, 0, 1], [w, 0, 1], [0, h, 1], [w, h, 1], [w / 2, h / 2, 1]], dtype=np.float64)
+        moved = corners @ H.T
+        moved = moved[:, :2] / moved[:, 2:3]
+        c = moved[4] - corners[4, :2]
+        self.last_motion = (float(c[0]), float(c[1]))
+        if float(np.abs(moved - corners[:, :2]).max()) < 0.3:
+            self.last_motion = (0.0, 0.0)
+            return
+        if self._prev_feat is not None:
+            self._prev_feat = cv2.warpPerspective(self._prev_feat, H, (w, h), borderMode=cv2.BORDER_REPLICATE)
+        if self.energy is not None:
+            self.energy = cv2.warpPerspective(self.energy, H, (w, h))
+        if self.sat is not None:
+            self.sat = cv2.warpPerspective(self.sat, H, (w, h))
+        self._prev_small_gray = None             # korelacja fazowa zaczyna od nowa, gdyby żyroskop zamilkł
+        for t in self.tracks:
+            q = H @ np.array([t.kf.x[0], t.kf.x[1], 1.0])
+            t.kf.shift(q[0] / q[2] - t.kf.x[0], q[1] / q[2] - t.kf.x[1])
+            t.x, t.y = float(t.kf.x[0]), float(t.kf.x[1])
+        self._lost = [(lt, *(lambda q: (q[0] / q[2], q[1] / q[2]))(H @ np.array([lx, ly, 1.0])), lid)
+                      for lt, lx, ly, lid in self._lost]
+
     def _compensate_motion(self, gray: np.ndarray) -> None:
         h, w = gray.shape
         g = cv2.resize(gray, (_even_dft(w // 4), _even_dft(h // 4)), interpolation=cv2.INTER_AREA).astype(np.float32)
@@ -520,6 +590,107 @@ class LedIdReceiver:
                     t.last_seen_ts = ts
                     break
 
+    # ------------------------------------------------------------ konstelacje
+    def _pooled_signal(self, members: List[LedTrack]) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Wspólny sygnał grupy: każdy tor znormalizowany własnym progiem do -1..1,
+        potem średnia po torach, które w danej klatce istniały. Tory próbkujemy
+        co klatkę z tym samym czasem, więc historie zgadzają się od końca.
+        """
+        series = []
+        for t in members:
+            if len(t.decoder.samples) < 6:
+                continue
+            a = np.array(t.decoder.samples)
+            lo, hi = np.percentile(a[:, 1], (10, 90))
+            if hi - lo < max(self.cfg.min_contrast, 1e-6):
+                continue
+            series.append((a[:, 0], np.clip((a[:, 1] - 0.5 * (lo + hi)) / (0.5 * (hi - lo)), -1.0, 1.0)))
+        if len(series) < 2:
+            return None
+        base = max(series, key=lambda s: len(s[0]))[0]
+        acc, cnt = np.zeros(len(base)), np.zeros(len(base))
+        for tt, vv in series:
+            k = len(tt)
+            if abs(tt[0] - base[-k]) > 1e-3:
+                continue                         # historia nie pasuje klatka w klatkę - pomijamy tor
+            acc[-k:] += vv
+            cnt[-k:] += 1
+        return base, acc / np.maximum(cnt, 1)
+
+    def _constellate(self, ts: float) -> None:
+        """
+        Grupuje tory po zgodności mrugania (BlinkGrouper) i dzieli się ID w grupie:
+        tor bez własnego potwierdzonego odczytu dostaje ID grupy - z odczytów
+        pozostałych torów albo ze wspólnego dekodera grupy.
+        """
+        cfg = self.cfg
+        frame_ms = FRAME_CHIPS * cfg.chip_ms
+        self.grouper.radius_px = cfg.group_radius_px
+        gids = self.grouper.update(ts, [t.tid for t in self.tracks],
+                                   np.array([[t.x, t.y] for t in self.tracks]).reshape(-1, 2),
+                                   [t.cs_state for t in self.tracks])
+        groups: Dict[int, List[LedTrack]] = {}
+        for t in self.tracks:
+            t.gid = gids[t.tid]
+            groups.setdefault(t.gid, []).append(t)
+        self._gdec = {g: d for g, d in self._gdec.items() if g in groups}
+        self._gsince = {g: s for g, s in self._gsince.items() if g in groups and len(groups[g]) >= 2}
+        self.constellations = []
+        for gid, members in groups.items():
+            if len(members) < 2:
+                continue
+            since = self._gsince.setdefault(gid, ts)
+
+            def own(t: LedTrack) -> Optional[int]:
+                d = t.decoder
+                return d.confirmed_id if d.confirmed_id is not None and d.last_id == d.confirmed_id else None
+
+            # dwa tory grupy same potwierdziły RÓŻNE ID -> to nie jest jedna konstelacja
+            conf = [(t, own(t)) for t in members if own(t) is not None]
+            for a in range(len(conf)):
+                for b in range(a + 1, len(conf)):
+                    if conf[a][1] != conf[b][1]:
+                        self.grouper.block(conf[a][0].tid, conf[b][0].tid)
+
+            gdec = None
+            if cfg.cs_pool:
+                gdec = self._gdec.get(gid)
+                if gdec is None:
+                    gdec = self._gdec[gid] = TemplateDecoder(cfg.chip_hz, min_contrast=0.5)
+                if self._frame_idx % 2 == 0:
+                    pooled = self._pooled_signal(members)
+                    if pooled is not None:
+                        gdec.push_series(ts, *pooled)
+                if not fresh_ok(gdec, ts, frame_ms):
+                    gdec.confirmed_id = None
+
+            votes: Dict[int, int] = {}
+            for _, i in conf:
+                votes[i] = votes.get(i, 0) + 1
+            if gdec is not None and gdec.confirmed_id is not None and gdec.last_id == gdec.confirmed_id:
+                votes[gdec.confirmed_id] = votes.get(gdec.confirmed_id, 0) + 1
+            confirmed = bool(votes)
+            if not votes:                        # nic potwierdzonego - ID wstępne
+                if gdec is not None and gdec.last_id is not None and fresh_ok(gdec, ts, frame_ms):
+                    votes[gdec.last_id] = 1
+                for t in members:
+                    d = t.decoder
+                    if d.last_id is not None and fresh_ok(d, ts, frame_ms):
+                        votes[d.last_id] = votes.get(d.last_id, 0) + 1
+            group_id = max(votes, key=lambda i: (votes[i], -i)) if votes else None
+            if not confirmed and group_id is not None and 0 < cfg.cs_confirm_votes <= votes[group_id]:
+                confirmed = True
+            if group_id is not None:
+                for t in members:
+                    if own(t) is None and (t.drone_id != group_id or t.id_confirmed != confirmed
+                                           or t.inherited_ts is not None):
+                        t.drone_id, t.id_confirmed, t.inherited_ts, t.synced_with = group_id, confirmed, None, gid
+            self.constellations.append(Constellation(
+                gid=gid, track_ids=[t.tid for t in members],
+                x=float(np.mean([t.x for t in members])), y=float(np.mean([t.y for t in members])),
+                since_ts=since, drone_id=group_id, confirmed=confirmed))
+
     # ------------------------------------------------------------------ sygnał
     def _sample(self, t: LedTrack, feat: np.ndarray) -> float:
         """
@@ -534,7 +705,8 @@ class LedIdReceiver:
         t.roi = (x0, y0, x1, y1)
         level = float(feat[y0:y1, x0:x1].mean()) if x1 > x0 and y1 > y0 else 0.0
         t.levels.append(level)
-        if len(t.levels) >= 6 and (len(t.levels) % 3 == 0 or t.lohi is None):
+        # młody tor: próg co klatkę (pierwsze zgaśnięcie od razu daje stan dla konstelacji)
+        if len(t.levels) >= 6 and (len(t.levels) % 3 == 0 or len(t.levels) < 30 or t.lohi is None):
             t.lohi = tuple(np.percentile(np.array(t.levels), (10, 90)))
             t.contrast = float(t.lohi[1] - t.lohi[0])
         return level
@@ -549,10 +721,15 @@ class LedIdReceiver:
 
     # ------------------------------------------------------------------ główne
     def process(self, frame_bgr: np.ndarray, ts: float,
-                roi: Optional[Tuple[float, float, float, float]] = None) -> List[DroneObs]:
+                roi: Optional[Tuple[float, float, float, float]] = None,
+                cam_rot: Optional[np.ndarray] = None) -> List[DroneObs]:
         """
         roi = (x0, y0, x1, y1) w układzie obrazu pomniejszonego, np. ramka drona z
         detektora obiektów: nowi kandydaci na diodę tylko w niej. None = cały kadr.
+
+        cam_rot = obrót KAMERY od poprzedniej klatki jako wektor obrotu [rad] w osiach
+        kamery (x w prawo, y w dół, z do przodu), np. FcTelemetry.rotation() z żyroskopu
+        kontrolera lotu. Gdy podany, zastępuje kompensację ruchu z obrazu (korelację fazową).
         """
         cfg = self.cfg
         h, w = frame_bgr.shape[:2]
@@ -581,7 +758,9 @@ class LedIdReceiver:
         self._last_ts = ts
         if dt > 0:
             self._frame_dt = 0.9 * self._frame_dt + 0.1 * dt
-        if cfg.motion_comp:
+        if cam_rot is not None:
+            self._compensate_rotation(gray.shape, cam_rot)
+        elif cfg.motion_comp:
             self._compensate_motion(gray)
         self._predict(ts, dt)
         self._update_energy(feat)
@@ -608,9 +787,15 @@ class LedIdReceiver:
                 self._correct(t, t.x, t.y, cfg.kf_fine_px)
             level = self._sample(t, {"white": white, "gray": gray}.get(cfg.signal, feat))
             t.states.append(int(t.lohi is not None and level > 0.5 * sum(t.lohi)))
+            t.cs_state = 0
+            if t.lohi is not None and t.contrast >= cfg.min_contrast:
+                rel = (level - 0.5 * sum(t.lohi)) / (0.5 * t.contrast)
+                t.cs_state = 1 if rel > cfg.cs_margin else -1 if rel < -cfg.cs_margin else 0
             t.decoder.push(ts, level)
             dec = t.decoder
-            if t.synced_with is not None:
+            if cfg.constellations:
+                t.synced_with = None              # ID z grupy nakładamy co klatkę od nowa (_constellate)
+            elif t.synced_with is not None:
                 # ID z synchronizacji trzyma się, dopóki tor dalej mruga zgodnie
                 if dec.last_id is not None and fresh_ok(dec, ts, frame_ms) and dec.last_id != t.drone_id:
                     t.synced_with = None          # własny odczyt mówi co innego - wygrywa odczyt
@@ -628,7 +813,9 @@ class LedIdReceiver:
                 pass                             # przejęte ID czeka na odczyt
             else:
                 t.drone_id, t.id_confirmed, t.inherited_ts = None, False, None
-        if cfg.sync_adopt:
+        if cfg.constellations:
+            self._constellate(ts)
+        elif cfg.sync_adopt:
             self._adopt_synced_ids(ts)
 
         H, W = feat.shape
@@ -642,11 +829,17 @@ class LedIdReceiver:
         self.tracks = alive
         live_tids = {t.tid for t in self.tracks}
         for t in self.tracks:
-            if t.synced_with is not None and t.synced_with not in live_tids and not t.decoder.confirmed_id:
+            if not cfg.constellations and t.synced_with is not None and t.synced_with not in live_tids \
+                    and not t.decoder.confirmed_id:
                 # tor-wzór zniknął: zostaje przy ID, dopóki sam go nie potwierdzi (jak przejęte ID)
                 t.synced_with, t.id_confirmed, t.inherited_ts = None, False, ts
         self._lost = [e for e in self._lost if ts - e[0] < 800.0]
         self._dedupe()
+        if cfg.constellations:
+            live_tids = {t.tid for t in self.tracks}
+            for c in self.constellations:
+                c.track_ids = [k for k in c.track_ids if k in live_tids]
+            self.constellations = [c for c in self.constellations if len(c.track_ids) >= 2]
         return self._group((H, W), ts)
 
     def _dedupe(self) -> None:

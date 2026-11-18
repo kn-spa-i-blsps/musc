@@ -127,3 +127,119 @@ def test_kalman_follows_constant_velocity_through_gaps():
     for _ in range(3):                                   # 3 klatki bez pomiaru: przewidywanie
         kf.predict(dt)
     assert abs(kf.x[0] - (100.0 + vx * 62 * dt)) < 2.0
+
+
+# ---------------------------------------------------------------- konstelacje
+def _states(drone_id, phase_ms, t, hz=10.0, exposure_ms=16.0):
+    """Stan diody widziany przez kamerę w chwili t: +1 / -1, a 0, gdy klatka trafiła na zbocze."""
+    chips = encode_frame(drone_id)
+    chip_ms = 1000.0 / hz
+    on = sum(chips[int((t + phase_ms + k * exposure_ms / 6) // chip_ms) % CHIPS] for k in range(6)) / 6
+    return 1 if on > 0.65 else -1 if on < 0.35 else 0
+
+
+def test_constellations_group_by_blinking_before_any_id():
+    from constellation import BlinkGrouper
+    rng = random.Random(3)
+    worst = 0.0
+    for trial in range(30):
+        ids = rng.sample(range(N_IDS), 3)
+        phases = [rng.uniform(0, 2600) for _ in ids]
+        owner = [0, 0, 0, 1, 1, 1, 2, 2]                      # 8 torów: 3 + 3 + 2 diody trzech dronów
+        xy = np.array([[10.0 * i, 0.0] for i in range(len(owner))])   # przemieszane w obrazie - liczy się mruganie
+        g = BlinkGrouper(code_ms=2600.0, chip_ms=100.0)
+        done = None
+        for f in range(240):
+            t = f * 1000.0 / 30 + rng.uniform(-1.5, 1.5)
+            st = [_states(ids[o], phases[o], t) for o in owner]
+            st[rng.randrange(len(st))] = 0                    # co klatkę jeden tor bez pewnego stanu
+            gid = g.update(t, list(range(len(owner))), xy, st)
+            good = all((gid[a] == gid[b]) == (owner[a] == owner[b])
+                       for a in range(len(owner)) for b in range(a))
+            if good and done is None:
+                done = t
+            elif not good and t > 2600.0:
+                raise AssertionError((trial, f, gid))         # po jednym obiegu kodu podział ma być stabilny
+            elif not good:
+                done = None
+        assert done is not None, trial
+        worst = max(worst, done)
+    assert worst < 2600.0                                     # zawsze szybciej niż jeden obieg kodu
+
+
+def test_constellation_keeps_group_number_and_respects_block():
+    from constellation import BlinkGrouper
+    g = BlinkGrouper(code_ms=2600.0, chip_ms=100.0)
+    xy = np.zeros((3, 2))
+    gids = []
+    for f in range(90):
+        t = f * 1000.0 / 30
+        gid = g.update(t, [7, 8, 9], xy, [_states(5, 0.0, t)] * 3)
+        gids.append(gid[7])
+    assert gid[7] == gid[8] == gid[9] and len(set(gids[30:])) == 1
+    g.block(8, 9)                                             # np. dekoder odczytał na nich dwa różne ID
+    gid = g.update(3000.0, [7, 8, 9], xy, [1, 1, 1])
+    assert gid[8] != gid[9]
+    gid = g.update(3033.0, [7, 9], xy[:2], [1, 1])            # tor 8 zniknął - reszta trzyma numer grupy
+    assert gid[7] == gids[-1]
+
+
+def test_video_constellation_forms_before_id_is_read():
+    res = run(fps=30, chip_hz=10, seconds=6, ids=[3, 17, 60, 120], seed=5, verbose=False)
+    assert set(res["first_group"]) == {3, 17, 60, 120}
+    for i, t_id in res["first_seen"].items():
+        assert res["first_group"][i] < t_id
+
+
+# ---------------------------------------------------------- telemetria FC
+def test_msp_frames():
+    from fc_telemetry import MSP_RAW_IMU, msp_frame, msp_parse
+    assert msp_frame(MSP_RAW_IMU) == b"$M<\x00\x66\x66"
+    payload = bytes(range(18))
+    chk = 18 ^ MSP_RAW_IMU
+    for b in payload:
+        chk ^= b
+    reply = b"$M>" + bytes([18, MSP_RAW_IMU]) + payload + bytes([chk])
+    assert msp_parse(b"xx" + reply[:10]) is None              # niepełna ramka - czekamy na resztę
+    assert msp_parse(b"xx" + reply + b"$M") == (MSP_RAW_IMU, payload, 2 + len(reply))
+    assert msp_parse(reply[:-1] + b"\x00")[0] == -1           # zła suma kontrolna
+
+
+def test_gyro_integration_and_camera_axes():
+    from fc_telemetry import GyroIntegrator, body_to_cam
+    gi = GyroIntegrator()
+    for k in range(200):                                      # 200 Hz, yaw 0.5 rad/s, pitch rośnie liniowo
+        t = 5.0 * k
+        gi.add(t, (0.0, 0.001 * t, 0.5))
+    rot = gi.rotation(101.3, 134.6)
+    assert abs(rot[2] - 0.5 * 0.0333) < 1e-6
+    assert abs(rot[1] - 0.001 * (134.6 ** 2 - 101.3 ** 2) / 2 / 1000) < 1e-6
+    assert gi.rotation(990.0, 1100.0) is None                 # telemetria nie sięga tak daleko - nie zgadujemy
+    assert np.allclose(body_to_cam((0.1, 0.2, 0.3)), (0.2, 0.3, 0.1))          # pitch -> x, yaw -> y, roll -> z
+    assert np.allclose(body_to_cam((0.0, 0.0, 1.0), tilt_deg=90.0), (0.0, 0.0, -1.0), atol=1e-9)
+    assert np.allclose(body_to_cam((0.1, 0.2, 0.3), signs=(1, -1, -1)), (-0.2, -0.3, 0.1))
+
+
+def test_fc_calibration_recovers_signs_and_latency():
+    from fc_telemetry import GyroIntegrator, fit_calibration
+    gi = GyroIntegrator()
+    yaw = lambda t: 0.05 * np.sin(t / 300.0)                  # kąt kamery [rad]
+    pitch = lambda t: 0.03 * np.sin(t / 170.0 + 1.0)
+    for k in range(2400):                                     # FC raportuje pitch i yaw z odwrotnym znakiem
+        t = 2.5 * k
+        gi.add(t, (0.0, -0.03 / 0.170 * np.cos(t / 170.0 + 1.0), -0.05 / 0.300 * np.cos(t / 300.0)))
+    fx, lag = 750.0, 40.0                                     # obraz spóźniony o 40 ms względem żyroskopu
+    ts = np.arange(200.0, 5800.0, 33.3)
+    shifts = np.array([[np.nan, np.nan]] + [[-fx * (yaw(b - lag) - yaw(a - lag)), fx * (pitch(b - lag) - pitch(a - lag))]
+                                            for a, b in zip(ts, ts[1:])])
+    res = fit_calibration(ts, shifts, gi, fx, tilt_deg=0.0)
+    assert res["signs"][1:] == (-1.0, -1.0) and res["latency_ms"] == 40.0 and res["corr"] > 0.99
+    assert abs(res["scale"] - 1.0) < 0.02
+
+
+def test_moving_camera_needs_compensation_and_gyro_provides_it():
+    kw = dict(fps=30, chip_hz=10, seconds=8, ids=[3, 17, 60, 120], seed=5, verbose=False, cam_shake_deg=3.0)
+    blind = run(motion_comp=False, **kw)
+    gyro = run(motion_comp=False, gyro=True, **kw)
+    assert gyro["found"] == {3, 17, 60, 120} and not gyro["wrong"]
+    assert gyro["coverage"] > 3 * blind["coverage"]

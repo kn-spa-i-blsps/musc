@@ -95,6 +95,22 @@ class TemplateDecoder:
         self._n_since_eval = 0
         return self._evaluate(ts_ms)
 
+    def push_series(self, ts_ms: float, t: np.ndarray, v: np.ndarray) -> Optional[int]:
+        """
+        Ocena na gotowym oknie próbek (czasy t rosnąco, ostatnia = teraz) zamiast
+        dokładania po jednej: sygnał wspólny konstelacji składany co klatkę od nowa
+        z torów, które akurat do niej należą. Stan potwierdzania ID zostaje.
+        """
+        keep = t >= ts_ms - 1.2 * self.frame_ms
+        self.samples = deque(zip(t[keep].tolist(), v[keep].tolist()))
+        if not self.samples:
+            self.coverage = 0.0
+            return None
+        self.coverage = min(1.0, (ts_ms - self.samples[0][0]) / self.frame_ms)
+        if self.coverage < self.min_coverage:
+            return None
+        return self._evaluate(ts_ms)
+
     def reset(self) -> None:
         self.samples.clear()
         self.coverage = 0.0

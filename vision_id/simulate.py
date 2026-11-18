@@ -17,7 +17,7 @@ Uwzględnia rzeczy, które w realu psują odczyt:
 import argparse
 import math
 import random
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -64,10 +64,24 @@ class SimDrone:
         return pts
 
 
-def render(drones: List[SimDrone], t: float, exposure_ms: float, rng: np.random.Generator) -> np.ndarray:
+HFOV_DEG = 65.0
+FX = (W / 2) / math.tan(math.radians(HFOV_DEG) / 2)
+
+
+def cam_angles(t: float, shake_deg: float) -> Tuple[float, float]:
+    """Obrót kamery (yaw w prawo, pitch w górę) [rad] w chwili t: drganie drona w zawisie + korekty kursu."""
+    a = math.radians(shake_deg)
+    return (a * (math.sin(2 * math.pi * 0.7 * t / 1000) + 0.4 * math.sin(2 * math.pi * 2.3 * t / 1000 + 1.0)),
+            0.6 * a * (math.sin(2 * math.pi * 0.9 * t / 1000 + 2.0) + 0.4 * math.sin(2 * math.pi * 3.1 * t / 1000)))
+
+
+def render(drones: List[SimDrone], t: float, exposure_ms: float, rng: np.random.Generator,
+           offset: Tuple[float, float] = (0.0, 0.0)) -> np.ndarray:
+    """offset = przesunięcie całej sceny w obrazie [px] (obrót kamery)."""
+    ox, oy = offset
     img = np.full((H, W, 3), 35, np.float32)
     img += rng.normal(0, 4, img.shape).astype(np.float32)              # szum sensora
-    cv2.circle(img, (W - 120, 90), 14, (250, 250, 250), -1)            # statyczna lampa
+    cv2.circle(img, (int(W - 120 + ox), int(90 + oy)), 14, (250, 250, 250), -1)   # statyczna lampa
     glow = np.zeros_like(img)
     for d in drones:
         frac = d.on_fraction(t, t + exposure_ms)
@@ -77,34 +91,61 @@ def render(drones: List[SimDrone], t: float, exposure_ms: float, rng: np.random.
             if i == d.occluded_led and d.occl_from < t < d.occl_from + 700:
                 continue
             col = np.array(d.color, np.float32) * frac
-            cv2.circle(glow, (int(x), int(y)), 4, col.tolist(), -1)
+            cv2.circle(glow, (int(x + ox), int(y + oy)), 4, col.tolist(), -1)
     glow = cv2.GaussianBlur(glow, (0, 0), 1.5) * 1.6
     return np.clip(img + glow, 0, 255).astype(np.uint8)
 
 
 def run(fps: float, chip_hz: float, seconds: float, ids: List[int], seed: int,
-        out: Optional[str] = None, verbose: bool = True) -> dict:
+        out: Optional[str] = None, verbose: bool = True, cam_shake_deg: float = 0.0,
+        gyro: bool = False, motion_comp: bool = True) -> dict:
+    """
+    cam_shake_deg > 0: kamera (dron, na którym siedzi) obraca się o tyle stopni w obie
+    strony; gyro=True podaje odbiornikowi ten obrót tak, jak podałby go żyroskop FC.
+    """
     rnd = random.Random(seed)
     nrng = np.random.default_rng(seed)
     drones = [SimDrone(i, chip_hz, x=rnd.uniform(200, W - 200), y=rnd.uniform(150, H - 150), rng=rnd)
               for i in ids]
     # symulowane diody mają losowe kolory -> tryb samego mrugania
-    rx = LedIdReceiver(ReceiverConfig(chip_hz=chip_hz, led_color=None))
+    rx = LedIdReceiver(ReceiverConfig(chip_hz=chip_hz, led_color=None, hfov_deg=HFOV_DEG, motion_comp=motion_comp))
     writer = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H)) if out else None
 
     first_seen = {}
+    first_group = {}                       # dron -> kiedy jego diody pierwszy raz były w jednej konstelacji
     wrong = set()
+    seen_frames = 0
     frame_ms = 1000.0 / fps
-    for f in range(int(seconds * fps)):
+    prev_ang = None
+    n_frames = int(seconds * fps)
+    for f in range(n_frames):
         t = f * frame_ms + rnd.uniform(-1.5, 1.5)
-        frame = render(drones, t, exposure_ms=0.5 * frame_ms, rng=nrng)
+        yaw, pitch = cam_angles(t, cam_shake_deg) if cam_shake_deg else (0.0, 0.0)
+        offset = (-FX * math.tan(yaw), FX * math.tan(pitch))          # kamera w prawo/górę -> scena w lewo/dół
+        frame = render(drones, t, exposure_ms=0.5 * frame_ms, rng=nrng, offset=offset)
         if writer:
             writer.write(frame)
-        for d in rx.process(frame, t):
+        cam_rot = None
+        if gyro and prev_ang is not None:
+            # wektor obrotu w osiach kamery (x w prawo, y w dół, z do przodu): pitch w górę = +x, yaw w prawo = +y
+            cam_rot = np.array([pitch - prev_ang[1], yaw - prev_ang[0], 0.0])
+        prev_ang = (yaw, pitch)
+        for d in rx.process(frame, t, cam_rot=cam_rot):
             if d.drone_id in ids:
                 first_seen.setdefault(d.drone_id, t)
+                seen_frames += 1
             else:
                 wrong.add(d.drone_id)
+        # czyje diody są w której konstelacji (tor -> najbliższa prawdziwa dioda)
+        owner = {}
+        for tr in rx.tracks:
+            best = min(((math.hypot(x + offset[0] - tr.x, y + offset[1] - tr.y), d.drone_id)
+                        for d in drones for _, x, y in d.leds(t)), default=(1e9, None))
+            owner[tr.tid] = best[1] if best[0] < 12 else None
+        for c in rx.constellations:
+            own = [owner.get(k) for k in c.track_ids if owner.get(k) is not None]
+            if len(own) >= 2 and len(set(own)) == 1:
+                first_group.setdefault(own[0], t)
     if writer:
         writer.release()
 
@@ -113,10 +154,12 @@ def run(fps: float, chip_hz: float, seconds: float, ids: List[int], seed: int,
         print(f"fps={fps:g} chip={chip_hz:g}Hz ({fps / chip_hz:.1f} klatki/chip), ramka={frame_s:.1f}s")
         for i in ids:
             s = f"{first_seen[i] / 1000:.2f}s" if i in first_seen else "NIE ZDEKODOWANO"
-            print(f"  ID {i:2d}: {s}")
+            g = f"{first_group[i] / 1000:.2f}s" if i in first_group else "brak"
+            print(f"  ID {i:2d}: {s}   (konstelacja po {g})")
         if wrong:
             print(f"  FAŁSZYWE ID: {sorted(wrong)}")
-    return {"found": set(first_seen), "wrong": wrong}
+    return {"found": set(first_seen), "wrong": wrong, "first_seen": first_seen, "first_group": first_group,
+            "coverage": seen_frames / max(n_frames * len(ids), 1)}
 
 
 def main() -> None:
@@ -127,8 +170,11 @@ def main() -> None:
     ap.add_argument("--ids", type=int, nargs="+", default=[0, 5, 42, 63])
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--out")
+    ap.add_argument("--cam-shake", type=float, default=0.0, help="obrót kamery +- tyle stopni (dron z kamerą się rusza)")
+    ap.add_argument("--gyro", action="store_true", help="podaj odbiornikowi obrót kamery jak z żyroskopu FC")
     args = ap.parse_args()
-    res = run(args.fps, args.chip_hz, args.seconds, args.ids, args.seed, args.out)
+    res = run(args.fps, args.chip_hz, args.seconds, args.ids, args.seed, args.out,
+              cam_shake_deg=args.cam_shake, gyro=args.gyro)
     ok = res["found"] == set(args.ids) and not res["wrong"]
     raise SystemExit(0 if ok else 1)
 

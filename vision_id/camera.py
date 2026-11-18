@@ -73,6 +73,11 @@ class CameraThread:
                 self._recent.append(ts)
                 self._cv.notify()
 
+    @property
+    def t0(self) -> float:
+        """Początek zegara klatek (time.perf_counter) - ta sama oś czasu dla telemetrii FC."""
+        return self._t0
+
     def read(self, timeout: float = 2.0) -> Optional[Tuple[np.ndarray, float]]:
         """Następna klatka (frame, czas_ms) w kolejności, albo None, gdy kamera przestała działać."""
         with self._cv:

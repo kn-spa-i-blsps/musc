@@ -63,7 +63,7 @@ class SessionRecorder:
             tracks.append({
                 "tid": t.tid, "x": round(t.x, 1), "y": round(t.y, 1), "r": round(t.radius, 1),
                 "lvl": round(t.levels[-1], 1) if t.levels else None, "c": round(t.contrast, 1),
-                "id": t.drone_id, "conf": t.id_confirmed,
+                "id": t.drone_id, "conf": t.id_confirmed, "g": t.gid,
                 "sc": round(d.last_score, 3), "mg": round(d.last_margin, 3), "cov": round(d.coverage, 2),
                 "dec": d.last_id, "dec_conf": d.confirmed_id,
             })

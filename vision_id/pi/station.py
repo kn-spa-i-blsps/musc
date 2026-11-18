@@ -43,6 +43,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=8000)
 ap.add_argument("--exposure", type=int, default=250, help="czas naświetlania nagrań [us]")
 ap.add_argument("--root", default=str(Path.home() / "recordings"))
+ap.add_argument("--rot", type=int, default=180, choices=[0, 180], help="obrót obrazu: 180 = kamera zamontowana do góry nogami, 0 = bez obrotu")
 args = ap.parse_args()
 ROOT = Path(args.root)
 ROOT.mkdir(parents=True, exist_ok=True)
@@ -64,7 +65,7 @@ except Exception as e:                   # bez nadajnika też działa (np. nagra
 cam = Picamera2()
 cam.configure(cam.create_video_configuration(
     main={"size": (W, H), "format": "RGB888"}, sensor={"output_size": (W, H), "bit_depth": 10},
-    transform=Transform(hflip=1, vflip=1), buffer_count=8,
+    transform=Transform(hflip=int(args.rot == 180), vflip=int(args.rot == 180)), buffer_count=8,
     controls={"FrameDurationLimits": (int(1e6 / FPS), int(1e6 / FPS))}))
 cam.start()
 

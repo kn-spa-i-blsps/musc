@@ -17,9 +17,11 @@ import numpy as np
 
 from camera import CameraThread, open_camera
 from detector import PRESETS, LedIdReceiver, ReceiverConfig
+from fc_telemetry import FcTelemetry, parse_signs
 
 
 BLINK_CONTRAST = 30.0      # od tego kontrastu tor uznajemy za mrugający (rysujemy go)
+CS_COLORS = [(255, 180, 0), (255, 0, 255), (0, 128, 255), (255, 255, 0), (180, 105, 255), (0, 255, 180)]
 MAX_PLOTS = 4              # ile torów dostaje wykres sygnału w trybie podglądu
 
 
@@ -108,6 +110,19 @@ def draw(frame, rx: LedIdReceiver, drones, fps: float, debug: bool = False) -> N
                         cv2.FONT_HERSHEY_PLAIN, 1.0, (255, 255, 255), 1)
             draw_signal(frame, t, W - 160, 110 + k * 85)
 
+    # konstelacje: tory mrugające tym samym kodem połączone liniami (kolor = numer grupy),
+    # widoczne zanim dekoder odczyta ID ("K3" = grupa 3 bez ID)
+    pos = {t.tid: (int(t.x), int(t.y)) for t in rx.tracks}
+    for c in rx.constellations:
+        col = CS_COLORS[c.gid % len(CS_COLORS)]
+        pts = [pos[k] for k in c.track_ids if k in pos]
+        for a in range(len(pts)):
+            for b in range(a + 1, len(pts)):
+                cv2.line(frame, pts[a], pts[b], col, 1)
+        if c.drone_id is None and pts:
+            cv2.putText(frame, f"K{c.gid} ({len(pts)})", (int(c.x) + 12, int(c.y) - 12),
+                        cv2.FONT_HERSHEY_PLAIN, 1.0, col, 1)
+
     for d in drones:
         c = (int(d.x), int(d.y))
         r = int(max(20, d.spread_px / 2 + 15))
@@ -149,6 +164,12 @@ def main() -> None:
                     help="gotowy zestaw ustawień z detector.PRESETS (np. pi_niebo); --set nadpisuje dalej")
     ap.add_argument("--set", action="append", default=[], metavar="KLUCZ=WARTOŚĆ",
                     help="nadpisz pole ReceiverConfig, np. --set seek_source=False (można wiele)")
+    ap.add_argument("--fc", metavar="PORT", help="port kontrolera lotu (MSP, np. /dev/ttyACM0): kompensacja ruchu "
+                    "kamery z żyroskopu zamiast z obrazu (tylko z kamerą na żywo; patrz fc_telemetry.py)")
+    ap.add_argument("--fc-tilt", type=float, default=0.0, help="podniesienie kamery względem drona [deg]")
+    ap.add_argument("--fc-signs", type=parse_signs, default=(1.0, 1.0, 1.0),
+                    help="znaki osi roll/pitch/yaw, np. --fc-signs=+-+ (z fc_telemetry.py --calibrate)")
+    ap.add_argument("--fc-latency", type=float, default=0.0, help="opóźnienie obrazu względem żyroskopu [ms]")
     args = ap.parse_args()
 
     cfg = ReceiverConfig(chip_hz=args.chip_hz, energy_threshold=args.threshold, hfov_deg=args.hfov,
@@ -170,6 +191,13 @@ def main() -> None:
     else:
         cap = open_camera(args.camera)
         cam = CameraThread(cap)              # odczyt w tle - wolniejsza klatka nie gubi następnej
+    fc = None
+    if args.fc and cam is not None:
+        fc = FcTelemetry(args.fc, t0=cam.t0, tilt_deg=args.fc_tilt, signs=args.fc_signs, latency_ms=args.fc_latency)
+        print(f"FC {fc.variant} na {args.fc}: kompensacja ruchu kamery z żyroskopu")
+    elif args.fc:
+        print("--fc działa tylko z kamerą na żywo (nagranie nie ma telemetrii) - pomijam.")
+    prev_frame_ts = None
 
     file_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     ts_list = np.load(args.ts) if args.ts else None
@@ -208,7 +236,10 @@ def main() -> None:
                     writer = cv2.VideoWriter(args.record, cv2.VideoWriter_fourcc(*"mp4v"), 30, (w, h))
                 writer.write(frame)
 
-            drones = rx.process(frame, ts)
+            # obrót kamery od poprzedniej klatki; None (brak telemetrii) -> kompensacja z obrazu
+            cam_rot = fc.rotation(prev_frame_ts, ts) if fc is not None and prev_frame_ts is not None else None
+            prev_frame_ts = ts
+            drones = rx.process(frame, ts, cam_rot=cam_rot)
             if last_ts is not None and ts > last_ts:
                 fps_est = 0.9 * fps_est + 0.1 * 1000.0 / (ts - last_ts) if fps_est else 1000.0 / (ts - last_ts)
             last_ts = ts
@@ -249,6 +280,8 @@ def main() -> None:
         if key == ord("-"):
             cfg.energy_threshold = max(3, cfg.energy_threshold - 3)
 
+    if fc is not None:
+        fc.close()
     if cam is not None:
         cam.release()
     else:
