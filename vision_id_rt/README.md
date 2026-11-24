@@ -29,7 +29,8 @@ make python     # module for live.py
 
 ## Run
 
-Live from the Pi camera (stop `station.py` first, only one program can use the camera):
+Live from the Pi camera with a web preview at http://<pi>:8000 (stop `station.py` first, only
+one program can use the camera):
 
 ```bash
 python3 live.py --seconds 30
