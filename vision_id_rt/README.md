@@ -12,17 +12,34 @@ src/receiver.*    LED detection, tracking, grouping into drones
 src/decoder.*     ID decoding (template matching over all codes, phases and clock rates)
 src/kernels.hpp   whole-image passes, NEON
 src/recording.*   station recordings: MJPG AVI, ts.npy
-src/ledrx_rec.cpp command-line tool
+src/ledrx_rec.cpp command-line tool for recordings
+src/pyledrx.cpp   Python module (pybind11) used by live.py
+live.py           live decoding from the Pi camera
 ```
 
 ## Build
 
 ```bash
 sudo apt install build-essential libturbojpeg0-dev   # macOS: brew install jpeg-turbo
-make
+make            # build/ledrx_rec
+
+sudo apt install pybind11-dev python3-dev python3-picamera2 python3-opencv
+make python     # module for live.py
 ```
 
 ## Run
+
+Live from the Pi camera (stop `station.py` first, only one program can use the camera):
+
+```bash
+python3 live.py --seconds 30
+```
+
+It prints fps, detector time, CPU load and the IDs it sees once a second (camera + detector:
+31% of one core at 60 fps). The session is saved to `~/recordings/live_<time>/`: the last
+`--keep` seconds of video in the station format, plus `log.jsonl` with each frame's result.
+
+Recordings:
 
 ```bash
 build/ledrx_rec ~/recordings/03_ruch           # as fast as possible
@@ -34,6 +51,12 @@ and CPU load, and writes `result_rt.json`. `--dump frames.jsonl` saves every fra
 and drones.
 
 In code:
+
+```python
+import ledrx
+rx = ledrx.Receiver(chip_hz=20)
+drones = rx.process(bgr_frame, ts_ms)   # HxWx3 uint8 numpy array, padded rows are fine
+```
 
 ```cpp
 ledrx::Config cfg;            // cfg.chip_hz = 20 for a 60 fps camera
