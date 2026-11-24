@@ -142,6 +142,8 @@ class Preview:
 
 def serve(port, preview, status, set_exposure):
     class Handler(BaseHTTPRequestHandler):
+        timeout = 10
+
         def log_message(self, *args):
             pass
 
@@ -169,7 +171,7 @@ def serve(port, preview, status, set_exposure):
                         if jpeg:
                             self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
                                              + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n")
-                except (BrokenPipeError, ConnectionResetError):
+                except OSError:
                     pass
             else:
                 self.send_error(404)
