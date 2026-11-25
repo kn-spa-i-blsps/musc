@@ -3,16 +3,18 @@
     python3 live.py [--seconds 30] [--exposure 250] [--keep 10] [--port 8000] [--no-flip]
 
 Open http://<pi>:8000 for the preview with the decoder overlay. Stats are also printed once a
-second. On exit (Ctrl+C) the session is saved to ~/recordings/live_<time>/: raw.avi + ts.npy +
-info.json of the last --keep seconds (replay with `build/ledrx_rec DIR`) and log.jsonl with
-every frame's result.
+second. The page's "Save" button (and Ctrl+C or SIGTERM) saves the last --keep seconds to
+~/recordings/live_<time>/: raw.avi + ts.npy + info.json (replay with `build/ledrx_rec DIR`) and
+log.jsonl with what the decoder saw in every frame (drones and tracks with their signal level).
 """
 import argparse
 import json
 import resource
+import signal
 import sys
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -44,6 +46,8 @@ PAGE = """<!doctype html>
 <div id="stat">connecting...</div>
 <div id="tx"></div>
 <div style="margin:8px 0">Exposure [us]: <span id="exp"></span></div>
+<div style="margin:8px 0"><button class="on" id="save" onclick="fetch('/save', {method: 'POST'})">Save last seconds</button>
+  <span id="clip" style="color:#999"></span></div>
 <img src="/stream" alt="preview">
 <script>
 const EXPS = ["auto", "4000", "1000", "250", "125"];
@@ -54,6 +58,9 @@ async function poll() {
     ids.textContent = s.ids.length ? s.ids.map(i => "DRONE " + i).join("   ") : "-";
     stat.textContent = `${s.fps} fps   detector ${s.detect_ms} ms/frame   process CPU ${s.cpu}% of one core`;
     tx.textContent = "transmitter: " + s.transmitter;
+    save.textContent = `Save last ${s.keep} s`;
+    save.disabled = !s.keep || s.clip.startsWith("saving");
+    clip.textContent = s.clip;
     exp.innerHTML = EXPS.map(v => `<button class="${v == s.exposure ? 'on' : ''}" onclick="setExp('${v}')">${v}</button>`).join("");
   } catch (e) { stat.textContent = "no connection"; }
   setTimeout(poll, 500);
@@ -140,7 +147,7 @@ class Preview:
         return img
 
 
-def serve(port, preview, status, set_exposure):
+def serve(port, preview, status, set_exposure, request_clip):
     class Handler(BaseHTTPRequestHandler):
         timeout = 10
 
@@ -181,6 +188,9 @@ def serve(port, preview, status, set_exposure):
             if url.path == "/exposure":
                 set_exposure(parse_qs(url.query).get("v", ["250"])[0])
                 self._send(b"ok", "text/plain")
+            elif url.path == "/save":
+                request_clip()
+                self._send(b"ok", "text/plain")
             else:
                 self.send_error(404)
 
@@ -189,18 +199,22 @@ def serve(port, preview, status, set_exposure):
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
-def save(out: Path, frames, ts, n_kept, info, log):
+def save_clip(out: Path, frames, ring_ts, entries, info):
+    idx = np.flatnonzero(~np.isnan(ring_ts))
+    if not len(idx):
+        return None
+    idx = idx[np.argsort(ring_ts[idx])]
+    t0, t1 = ring_ts[idx[0]], ring_ts[idx[-1]]
     out.mkdir(parents=True, exist_ok=True)
-    (out / "log.jsonl").write_text("".join(json.dumps(x) + "\n" for x in log))
-    if n_kept:
-        order = np.argsort(ts[:n_kept])
-        writer = cv2.VideoWriter(str(out / "raw.avi"), cv2.VideoWriter_fourcc(*"MJPG"), FPS, (W, H))
-        for i in order:
-            writer.write(frames[i])
-        writer.release()
-        np.save(out / "ts.npy", ts[order] - ts[order[0]])
-    (out / "info.json").write_text(json.dumps(info, indent=1, ensure_ascii=False))
-    print("saved", out)
+    writer = cv2.VideoWriter(str(out / "raw.avi"), cv2.VideoWriter_fourcc(*"MJPG"), FPS, (W, H))
+    for i in idx:
+        writer.write(frames[i])
+    writer.release()
+    np.save(out / "ts.npy", ring_ts[idx] - t0)
+    clip_log = [dict(e, ts=round(e["ts"] - t0, 3)) for e in entries if t0 <= e["ts"] <= t1]
+    (out / "log.jsonl").write_text("".join(json.dumps(e) + "\n" for e in clip_log))
+    (out / "info.json").write_text(json.dumps({**info, "frames": len(idx)}, indent=1, ensure_ascii=False))
+    return out
 
 
 def main():
@@ -208,12 +222,15 @@ def main():
     ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0 = until Ctrl+C)")
     ap.add_argument("--exposure", default="250", help="exposure time [us] or auto")
     ap.add_argument("--chip-hz", type=float, default=20.0)
-    ap.add_argument("--keep", type=float, default=10, help="seconds of raw video kept for the session (0 = none)")
+    ap.add_argument("--keep", type=float, default=15, help="seconds of raw video kept for saving (0 = none)")
     ap.add_argument("--port", type=int, default=8000, help="web preview port (0 = off)")
     ap.add_argument("--no-flip", action="store_true")
     ap.add_argument("--root", default=str(Path.home() / "recordings"))
     args = ap.parse_args()
 
+    # Background jobs start with SIGINT ignored; make Ctrl+C and SIGTERM both stop and save.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
     transmitter = read_transmitter()
     print("transmitter:", transmitter)
     cam = Picamera2()
@@ -224,7 +241,10 @@ def main():
         controls={"FrameDurationLimits": (frame_us, frame_us)}))
     cam.start()
 
-    status = {"fps": 0, "detect_ms": 0, "cpu": 0, "ids": [], "transmitter": transmitter, "exposure": args.exposure}
+    n_ring = int(args.keep * FPS)
+    status = {"fps": 0, "detect_ms": 0, "cpu": 0, "ids": [], "transmitter": transmitter, "exposure": args.exposure,
+              "keep": args.keep, "clip": ""}
+    clip = {"requested": False, "thread": None}
 
     def set_exposure(v):
         if v == "auto":
@@ -237,14 +257,31 @@ def main():
     set_exposure(args.exposure)
     preview = Preview() if args.port else None
     if preview:
-        serve(args.port, preview, status, set_exposure)
+        serve(args.port, preview, status, set_exposure, lambda: clip.update(requested=True))
         print(f"preview: http://{__import__('socket').gethostname()}.local:{args.port}")
 
     rx = ledrx.Receiver(args.chip_hz)
-    n_ring = int(args.keep * FPS)
     frames = np.empty((n_ring, H, W, 3), np.uint8) if n_ring else None
-    ring_ts = np.zeros(n_ring)
-    log = []
+    ring_ts = np.full(n_ring, np.nan)
+    log = deque(maxlen=max(n_ring, 1))
+    info = {"size": [W, H], "fps_set": FPS, "arduino": transmitter, "source": "live.py"}
+
+    def saving():
+        return clip["thread"] is not None and clip["thread"].is_alive()
+
+    def start_clip():
+        def run():
+            out = save_clip(Path(args.root) / time.strftime("live_%Y%m%d_%H%M%S"), frames, ring_ts, entries,
+                            {**info, "exposure_us": status["exposure"]})
+            ring_ts[:] = np.nan
+            status["clip"] = f"saved {out}" if out else "nothing to save"
+            print(status["clip"], flush=True)
+
+        entries = list(log)
+        status["clip"] = "saving... (detection keeps running)"
+        clip["thread"] = threading.Thread(target=run)
+        clip["thread"].start()
+
     t_first = None
     n = 0
     sec = {"frames": 0, "detect": 0.0, "wall": time.perf_counter(), "cpu": cpu_seconds(), "ids": set()}
@@ -259,18 +296,25 @@ def main():
                     t0 = time.perf_counter()
                     drones = rx.process(m.array, t)
                     dt = time.perf_counter() - t0
-                    if n_ring:
+                    if n_ring and not saving():
                         frames[n % n_ring] = m.array
                         ring_ts[n % n_ring] = t
+                    tracks = rx.tracks()
                     if preview and n % PREVIEW_EVERY == 0:
-                        preview.offer(m.array, rx.tracks(), drones, rx.peaks)
+                        preview.offer(m.array, tracks, drones, rx.peaks)
             finally:
                 req.release()
             n += 1
             if args.seconds and t >= args.seconds * 1000:
                 break
             log.append({"ts": round(t, 3), "detect_ms": round(dt * 1000, 3),
-                        "drones": [[d.drone_id, round(d.x, 2), round(d.y, 2), d.confirmed] for d in drones]})
+                        "drones": [[d.drone_id, round(d.x, 2), round(d.y, 2), d.confirmed] for d in drones],
+                        "tracks": [[k["tid"], round(k["x"], 2), round(k["y"], 2), k["drone_id"], k["id_confirmed"],
+                                    round(k["level"], 2), round(k["lo"], 2), round(k["hi"], 2)] for k in tracks]})
+            if clip["requested"] and n_ring:
+                clip["requested"] = False
+                if not saving():
+                    start_clip()
             sec["frames"] += 1
             sec["detect"] += dt
             sec["ids"] |= {f"{d.drone_id}{'' if d.confirmed else '?'}" for d in drones}
@@ -286,10 +330,11 @@ def main():
         pass
     finally:
         cam.stop()
-    n_kept = min(n, n_ring)
-    info = {"size": [W, H], "fps_set": FPS, "frames": n_kept, "exposure_us": status["exposure"],
-            "arduino": transmitter, "source": "live.py"}
-    save(Path(args.root) / time.strftime("live_%Y%m%d_%H%M%S"), frames, ring_ts, n_kept, info, log)
+    if saving():
+        clip["thread"].join()
+    if n_ring:
+        start_clip()
+        clip["thread"].join()
 
 
 if __name__ == "__main__":

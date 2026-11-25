@@ -32,6 +32,9 @@ py::list tracks(const Receiver& rx) {
         d["drone_id"] = id_or_none(t->drone_id);
         d["id_confirmed"] = t->id_confirmed;
         d["contrast"] = t->contrast;
+        d["level"] = t->levels.empty() ? 0.0 : t->levels.back();
+        d["lo"] = t->lo;
+        d["hi"] = t->hi;
         d["states"] = std::vector<uint8_t>(t->states.begin(), t->states.end());
         out.append(d);
     }
