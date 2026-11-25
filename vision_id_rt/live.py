@@ -287,7 +287,7 @@ def main():
     ap.add_argument("--fc-latency", type=float, help="image delay behind the gyro [ms] (default: fc_mount.json)")
     ap.add_argument("--fc-calibrate", type=float, metavar="SECONDS", help="find the FC mounting and latency, then exit")
     ap.add_argument("--hfov", type=float, default=65.0, help="horizontal field of view [deg]")
-    ap.add_argument("--snap-px", type=float, default=20.0, help="LED search window around the prediction [px]")
+    ap.add_argument("--snap-px", type=float, default=30.0, help="LED search window around the prediction [px]")
     ap.add_argument("--search-grow", type=float, default=0.08, help="window growth while the LED is not seen [px/ms]")
     ap.add_argument("--max-tracks", type=int, default=24)
     args = ap.parse_args()

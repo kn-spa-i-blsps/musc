@@ -22,7 +22,7 @@ struct Config {
     float spawn_threshold = 25.0f;
     float energy_decay = 0.95f;
     int peak_nms_px = 11;
-    double snap_px = 20.0;
+    double snap_px = 30.0;  // 20 in the Python preset; 30 kept the LED with light and camera moving (2026-11-25 clips)
     double min_track_sep_px = 30.0;
     double lost_ms = 1000.0;
     double search_grow = 0.08;
