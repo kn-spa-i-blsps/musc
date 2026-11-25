@@ -1,0 +1,11 @@
+{
+ "size": [
+  1332,
+  990
+ ],
+ "fps_set": 60,
+ "arduino": "none ([Errno 2] could not open port /dev/ttyUSB0: [Errno 2] No such file or directory: '/dev/ttyUSB0')",
+ "source": "live.py",
+ "exposure_us": "250",
+ "frames": 900
+}
