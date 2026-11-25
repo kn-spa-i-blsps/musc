@@ -53,7 +53,7 @@ private:
 class FcTelemetry {
 public:
     FcTelemetry(const std::string& port, int baud = 115200, Mat3 mount = mount_matrix(0.0), double latency_ms = 0.0,
-                int attitude_every = 10);
+                double gyro_scale = 1.0, int attitude_every = 10);
     ~FcTelemetry();
     FcTelemetry(const FcTelemetry&) = delete;
     FcTelemetry& operator=(const FcTelemetry&) = delete;
@@ -70,6 +70,7 @@ public:
     std::string variant;
     Mat3 mount;
     double latency_ms;
+    double gyro_scale;  // raw MSP gyro units -> deg/s (some firmware sends raw sensor units)
     std::atomic<long> samples{0}, errors{0};
 
 private:

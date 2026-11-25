@@ -18,8 +18,9 @@ struct Homography {
 Homography rotation_homography(const double rot[3], int w, int h, double hfov_deg);
 
 // dst(x, y) = src(H^-1 (x, y)), bilinear. Outside the source: nearest edge (replicate) or 0.
-void warp(const float* src, float* dst, int w, int h, const Homography& H, bool replicate);
-void warp(const uint8_t* src, float* dst, int w, int h, const Homography& H, bool replicate);
+// Areas whose source values are all <= zero_below come out as 0.
+void warp(const float* src, float* dst, int w, int h, const Homography& H, bool replicate, float zero_below = 0.0f);
+void warp(const uint8_t* src, float* dst, int w, int h, const Homography& H, bool replicate, float zero_below = 0.0f);
 
 // Global shift between consecutive frames (like cv2.phaseCorrelate on a 4x smaller grayscale image).
 class PhaseCorrelator {

@@ -45,12 +45,12 @@ def format_mount(m):
 
 
 def load_mount():
-    """(mount matrix, latency ms) saved by live.py --fc-calibrate, or the default forward-looking camera."""
+    """(mount matrix, latency ms, gyro scale) saved by live.py --fc-calibrate, or the defaults."""
     try:
         d = json.loads(MOUNT_FILE.read_text())
-        return parse_mount(d["mount"]), float(d["latency_ms"])
+        return parse_mount(d["mount"]), float(d["latency_ms"]), float(d.get("gyro_scale", 1.0))
     except (OSError, ValueError, KeyError):
-        return ledrx.mount_matrix(0.0), 0.0
+        return ledrx.mount_matrix(0.0), 0.0, 1.0
 
 
 def find_port():
@@ -67,13 +67,13 @@ def main():
     ap.add_argument("--mount", help="camera axes from FC axes, e.g. x=+pitch,y=+yaw,z=+roll")
     args = ap.parse_args()
 
-    mount, latency = load_mount()
+    mount, latency, scale = load_mount()
     if args.mount:
         mount = parse_mount(args.mount)
     port = args.port or find_port()
-    fc = ledrx.FcTelemetry(port, args.baud, mount, latency)
-    print(f"FC {fc.variant} on {port}, mount {format_mount(mount)}. Ctrl+C to stop.")
-    print("            FC [deg/s]: roll  pitch    yaw |  camera [deg/s]: pan right  tilt up  roll cw | attitude r/p/y")
+    fc = ledrx.FcTelemetry(port, args.baud, mount, latency, scale)
+    print(f"FC {fc.variant} on {port}, mount {format_mount(mount)}, gyro scale {scale:.4g}. Ctrl+C to stop.")
+    print("            FC [deg/s]: roll  pitch    yaw |  camera [deg/s]: tilt up  pan right  roll cw | attitude r/p/y")
     try:
         last = ledrx.monotonic_ms()
         while True:

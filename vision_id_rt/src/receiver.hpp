@@ -164,7 +164,7 @@ private:
     static constexpr int HBLUR_ROWS = 8;
     std::vector<uint16_t> hblur_;
     std::vector<float> fdiff_, fhblur_;
-    std::vector<float> energy_, scratch_;
+    std::vector<float> energy_, energy_tmp_, scratch_;
     bool have_feat_ = false, have_energy_ = false;
     std::vector<uint32_t> candidates_;
     std::vector<Peak> peaks_;

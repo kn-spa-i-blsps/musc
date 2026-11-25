@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <future>
 #include <set>
 #include <tuple>
 
@@ -41,6 +42,16 @@ Receiver::Receiver(Config cfg)
 
 void Receiver::warp_history(const Homography& H) {
     const size_t n = static_cast<size_t>(w_) * h_;
+    // Energy never grows by itself and every decision starts at 15, so values below 1 can only fade out;
+    // zeroing them while warping changes no decision and leaves most tiles empty.
+    constexpr float ENERGY_FLOOR = 1.0f;
+    std::future<void> energy_done;
+    if (have_energy_) {
+        energy_tmp_.resize(n);
+        energy_done = std::async(std::launch::async, [&] {
+            warp(energy_.data(), energy_tmp_.data(), w_, h_, H, false, ENERGY_FLOOR);
+        });
+    }
     if (have_feat_) {
         prev_warped_.resize(n);
         if (have_warped_) {
@@ -52,10 +63,9 @@ void Receiver::warp_history(const Homography& H) {
         }
         have_warped_ = true;
     }
-    if (have_energy_) {
-        scratch_.resize(n);
-        warp(energy_.data(), scratch_.data(), w_, h_, H, false);
-        energy_.swap(scratch_);
+    if (energy_done.valid()) {
+        energy_done.get();
+        energy_.swap(energy_tmp_);
     }
 }
 

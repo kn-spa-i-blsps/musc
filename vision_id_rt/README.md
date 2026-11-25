@@ -64,7 +64,8 @@ The FC (Betaflight / INAV) must answer MSP on its USB port, or on a UART with MS
    `python3 live.py --fc-calibrate 15`. Point the camera at a still scene with detail and turn
    it up/down and left/right. It tries all 24 right-angle mountings and the latency between gyro
    and image, prints the agreement (trust it above ~0.7) and saves the result to `fc_mount.json`,
-   which `live.py --fc` and `fc_check.py` then use.
+   which `live.py --fc` and `fc_check.py` then use. It also measures the gyro scale: the Betaflight
+   build tested here sends raw sensor units over MSP (scale ~0.069) rather than deg/s.
 3. The mounting can also be given by hand: `--fc-mount x=+pitch,y=+yaw,z=+roll` (camera x right,
    y down, z forward, each as a signed FC axis).
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <future>
 
 namespace ledrx {
 namespace {
@@ -36,26 +37,127 @@ void fft2(std::vector<cf>& a, int n, bool inverse) {
 }
 
 template <class T>
-void warp_impl(const T* src, float* dst, int w, int h, const Homography& H, bool replicate) {
-    Homography inv = H.inverse();
-    auto at = [&](int x, int y) -> float {
-        if (x < 0 || y < 0 || x >= w || y >= h) {
-            if (!replicate) return 0.0f;
-            x = std::clamp(x, 0, w - 1);
-            y = std::clamp(y, 0, h - 1);
+float sample_border(const T* src, int w, int h, int x, int y, bool replicate) {
+    if (x < 0 || y < 0 || x >= w || y >= h) {
+        if (!replicate) return 0.0f;
+        x = std::clamp(x, 0, w - 1);
+        y = std::clamp(y, 0, h - 1);
+    }
+    return static_cast<float>(src[static_cast<size_t>(y) * w + x]);
+}
+
+template <class T>
+float bilinear_border(const T* src, int w, int h, double sx, double sy, bool replicate) {
+    int x0 = static_cast<int>(std::floor(sx)), y0 = static_cast<int>(std::floor(sy));
+    float fx = static_cast<float>(sx - x0), fy = static_cast<float>(sy - y0);
+    float top = sample_border(src, w, h, x0, y0, replicate) * (1 - fx) + sample_border(src, w, h, x0 + 1, y0, replicate) * fx;
+    float bot = sample_border(src, w, h, x0, y0 + 1, replicate) * (1 - fx) +
+                sample_border(src, w, h, x0 + 1, y0 + 1, replicate) * fx;
+    return top * (1 - fy) + bot * fy;
+}
+
+// dst(x, y) = src(x - tx, y - ty): every pixel has the same interpolation weights, rows are read in order.
+template <class T>
+void translate_impl(const T* src, float* dst, int w, int h, double tx, double ty, bool replicate) {
+    const int ox = static_cast<int>(std::floor(-tx)), oy = static_cast<int>(std::floor(-ty));
+    const float fx = static_cast<float>(-tx - ox), fy = static_cast<float>(-ty - oy);
+    const float w00 = (1 - fx) * (1 - fy), w01 = fx * (1 - fy), w10 = (1 - fx) * fy, w11 = fx * fy;
+    const int x_lo = std::max(0, -ox), x_hi = std::min(w, w - 1 - ox);
+    for (int y = 0; y < h; ++y) {
+        float* out = dst + static_cast<size_t>(y) * w;
+        const int sy = y + oy;
+        if (sy < 0 || sy + 1 >= h || x_lo >= x_hi) {
+            for (int x = 0; x < w; ++x) out[x] = bilinear_border(src, w, h, x - tx, y - ty, replicate);
+            continue;
         }
-        return static_cast<float>(src[static_cast<size_t>(y) * w + x]);
+        const T* a = src + static_cast<size_t>(sy) * w + ox;
+        const T* b = a + w;
+        for (int x = 0; x < x_lo; ++x) out[x] = bilinear_border(src, w, h, x - tx, y - ty, replicate);
+        for (int x = x_lo; x < x_hi; ++x)
+            out[x] = w00 * static_cast<float>(a[x]) + w01 * static_cast<float>(a[x + 1]) + w10 * static_cast<float>(b[x]) +
+                     w11 * static_cast<float>(b[x + 1]);
+        for (int x = x_hi; x < w; ++x) out[x] = bilinear_border(src, w, h, x - tx, y - ty, replicate);
+    }
+}
+
+// Dark frames are mostly zero, so only 32x32 tiles whose source area holds something above `zero_below`
+// are interpolated; the rest are zero-filled.
+template <class T>
+void warp_impl(const T* src, float* dst, int w, int h, const Homography& H, bool replicate, float zero_below) {
+    const double* m = H.h;
+    if (m[0] == 1 && m[1] == 0 && m[3] == 0 && m[4] == 1 && m[6] == 0 && m[7] == 0 && m[8] == 1) {
+        translate_impl(src, dst, w, h, m[2], m[5], replicate);
+        return;
+    }
+    constexpr int TS = 32;
+    const int tw = (w + TS - 1) / TS, th = (h + TS - 1) / TS;
+    std::vector<float> tile_max(static_cast<size_t>(tw) * th, 0.0f);
+    auto max_rows = [&](int ta, int tb) {
+        for (int y = ta * TS; y < std::min(h, tb * TS); ++y) {
+            const T* row = src + static_cast<size_t>(y) * w;
+            float* tm = tile_max.data() + static_cast<size_t>(y / TS) * tw;
+            for (int t = 0; t < tw; ++t) {
+                T mx = 0;
+                for (int x = t * TS, e = std::min(w, x + TS); x < e; ++x) mx = std::max(mx, row[x]);
+                tm[t] = std::max(tm[t], static_cast<float>(mx));
+            }
+        }
     };
-    for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x) {
-            double sx, sy;
-            inv.apply(x, y, sx, sy);
-            int x0 = static_cast<int>(std::floor(sx)), y0 = static_cast<int>(std::floor(sy));
-            float fx = static_cast<float>(sx - x0), fy = static_cast<float>(sy - y0);
-            float top = at(x0, y0) * (1 - fx) + at(x0 + 1, y0) * fx;
-            float bot = at(x0, y0 + 1) * (1 - fx) + at(x0 + 1, y0 + 1) * fx;
-            dst[static_cast<size_t>(y) * w + x] = top * (1 - fy) + bot * fy;
+    auto half = std::async(std::launch::async, max_rows, 0, th / 2);
+    max_rows(th / 2, th);
+    half.get();
+    const Homography inv = H.inverse();
+    auto tile_rows = [&](int ta, int tb) {
+    for (int ty = ta; ty < tb; ++ty)
+        for (int tx = 0; tx < tw; ++tx) {
+            const int x0 = tx * TS, x1 = std::min(w, x0 + TS), y0 = ty * TS, y1 = std::min(h, y0 + TS);
+            double lo_x = 1e30, hi_x = -1e30, lo_y = 1e30, hi_y = -1e30;
+            for (int c = 0; c < 4; ++c) {
+                double sx, sy;
+                inv.apply(c & 1 ? x1 : x0, c & 2 ? y1 : y0, sx, sy);
+                lo_x = std::min(lo_x, sx), hi_x = std::max(hi_x, sx), lo_y = std::min(lo_y, sy), hi_y = std::max(hi_y, sy);
+            }
+            int sx0 = std::clamp(static_cast<int>(std::floor(lo_x)) - 2, 0, w - 1);
+            int sx1 = std::clamp(static_cast<int>(std::floor(hi_x)) + 2, 0, w - 1);
+            int sy0 = std::clamp(static_cast<int>(std::floor(lo_y)) - 2, 0, h - 1);
+            int sy1 = std::clamp(static_cast<int>(std::floor(hi_y)) + 2, 0, h - 1);
+            float mx = 0;
+            for (int a = sy0 / TS; a <= sy1 / TS; ++a)
+                for (int b = sx0 / TS; b <= sx1 / TS; ++b) mx = std::max(mx, tile_max[static_cast<size_t>(a) * tw + b]);
+            if (mx <= zero_below) {
+                for (int y = y0; y < y1; ++y) std::fill(dst + static_cast<size_t>(y) * w + x0, dst + static_cast<size_t>(y) * w + x1, 0.0f);
+                continue;
+            }
+            // Exact projective mapping at the tile corners, linear in between (the error is far below a
+            // pixel for frame-to-frame rotations).
+            double c[4][2];
+            for (int k = 0; k < 4; ++k) inv.apply(k & 1 ? x1 : x0, k & 2 ? y1 : y0, c[k][0], c[k][1]);
+            const double span_x = x1 - x0, span_y = y1 - y0;
+            for (int y = y0; y < y1; ++y) {
+                float* out = dst + static_cast<size_t>(y) * w;
+                double v = (y - y0) / span_y;
+                double lx = c[0][0] + (c[2][0] - c[0][0]) * v, ly = c[0][1] + (c[2][1] - c[0][1]) * v;
+                double rx = c[1][0] + (c[3][0] - c[1][0]) * v, ry = c[1][1] + (c[3][1] - c[1][1]) * v;
+                float sx = static_cast<float>(lx), sy = static_cast<float>(ly);
+                const float dsx = static_cast<float>((rx - lx) / span_x), dsy = static_cast<float>((ry - ly) / span_x);
+                for (int x = x0; x < x1; ++x, sx += dsx, sy += dsy) {
+                    int ix = static_cast<int>(std::floor(sx)), iy = static_cast<int>(std::floor(sy));
+                    if (ix < 0 || iy < 0 || ix >= w - 1 || iy >= h - 1) {
+                        out[x] = bilinear_border(src, w, h, sx, sy, replicate);
+                        continue;
+                    }
+                    float fx = sx - ix, fy = sy - iy;
+                    const T* p = src + static_cast<size_t>(iy) * w + ix;
+                    float top = p[0] + (static_cast<float>(p[1]) - p[0]) * fx;
+                    float bot = p[w] + (static_cast<float>(p[w + 1]) - p[w]) * fx;
+                    out[x] = top + (bot - top) * fy;
+                }
+            }
         }
+    };
+    auto first = std::async(std::launch::async, tile_rows, 0, th / 2);
+    tile_rows(th / 2, th);
+    first.get();
 }
 
 }  // namespace
@@ -108,12 +210,12 @@ Homography rotation_homography(const double rot[3], int w, int h, double hfov_de
     return H;
 }
 
-void warp(const float* src, float* dst, int w, int h, const Homography& H, bool replicate) {
-    warp_impl(src, dst, w, h, H, replicate);
+void warp(const float* src, float* dst, int w, int h, const Homography& H, bool replicate, float zero_below) {
+    warp_impl(src, dst, w, h, H, replicate, zero_below);
 }
 
-void warp(const uint8_t* src, float* dst, int w, int h, const Homography& H, bool replicate) {
-    warp_impl(src, dst, w, h, H, replicate);
+void warp(const uint8_t* src, float* dst, int w, int h, const Homography& H, bool replicate, float zero_below) {
+    warp_impl(src, dst, w, h, H, replicate, zero_below);
 }
 
 bool PhaseCorrelator::update(const uint8_t* bgr, int width, int height, size_t stride, double& dx, double& dy,

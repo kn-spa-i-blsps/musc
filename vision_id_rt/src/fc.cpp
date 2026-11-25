@@ -119,8 +119,8 @@ speed_t baud_constant(int baud) {
 
 }  // namespace
 
-FcTelemetry::FcTelemetry(const std::string& port, int baud, Mat3 m, double latency, int attitude_every)
-    : mount(m), latency_ms(latency), attitude_every_(attitude_every) {
+FcTelemetry::FcTelemetry(const std::string& port, int baud, Mat3 m, double latency, double scale, int attitude_every)
+    : mount(m), latency_ms(latency), gyro_scale(scale), attitude_every_(attitude_every) {
     fd_ = ::open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd_ < 0) throw std::runtime_error("cannot open " + port + ": " + std::strerror(errno));
     termios tio{};
@@ -206,7 +206,10 @@ void FcTelemetry::run() {
 }
 
 std::optional<Vec3> FcTelemetry::rotation_body(double t0, double t1) const {
-    return gyro_.rotation(t0 - latency_ms, t1 - latency_ms);
+    auto rot = gyro_.rotation(t0 - latency_ms, t1 - latency_ms);
+    if (rot)
+        for (double& v : *rot) v *= gyro_scale;
+    return rot;
 }
 
 std::optional<Vec3> FcTelemetry::rotation(double t0, double t1) const {

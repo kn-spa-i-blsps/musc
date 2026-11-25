@@ -262,11 +262,11 @@ def calibrate(cam, fc, seconds, hfov):
     mount = format_mount(res.mount)
     print(f"gyro vs image agreement {res.corr:.2f} (1.0 = perfect; below ~0.7 do not trust it), {res.n} frames")
     print(f"  mount {mount}, latency {res.latency_ms:.0f} ms")
-    print(f"  image/gyro motion scale {res.scale:.2f}" + ("" if 0.85 < res.scale < 1.15 else
-          f" (far from 1.0: try --hfov {2 * np.degrees(np.arctan(np.tan(np.radians(hfov) / 2) / max(res.scale, 1e-3))):.0f})"))
+    print(f"  gyro scale {res.scale:.4g} (image motion / raw gyro; 1.0 = gyro in deg/s and --hfov right, "
+          f"~0.061 = raw sensor units at 2000 deg/s)")
     if res.corr >= 0.7:
-        MOUNT_FILE.write_text(json.dumps({"mount": mount, "latency_ms": res.latency_ms, "corr": round(res.corr, 3),
-                                          "scale": round(res.scale, 3)}, indent=1))
+        MOUNT_FILE.write_text(json.dumps({"mount": mount, "latency_ms": res.latency_ms, "gyro_scale": res.scale,
+                                          "corr": round(res.corr, 3)}, indent=1))
         print(f"saved to {MOUNT_FILE}")
     else:
         print("not saved (agreement too low); move the camera more, in front of a scene with more detail")
@@ -304,14 +304,15 @@ def main():
 
     fc = None
     if args.fc or args.fc_calibrate:
-        mount, latency = load_mount()
+        mount, latency, gyro_scale = load_mount()
         if args.fc_mount:
             mount = parse_mount(args.fc_mount)
         if args.fc_latency is not None:
             latency = args.fc_latency
         port = find_port() if args.fc in (None, "auto") else args.fc
-        fc = ledrx.FcTelemetry(port, 115200, mount, latency)
-        print(f"FC {fc.variant} on {port}: mount {format_mount(fc.mount)}, latency {fc.latency_ms:g} ms")
+        fc = ledrx.FcTelemetry(port, 115200, mount, latency, gyro_scale)
+        print(f"FC {fc.variant} on {port}: mount {format_mount(fc.mount)}, latency {fc.latency_ms:g} ms, "
+              f"gyro scale {fc.gyro_scale:.4g}")
         req = cam.capture_request()
         lag = ledrx.monotonic_ms() - req.get_metadata()["SensorTimestamp"] / 1e6
         req.release()

@@ -139,12 +139,12 @@ PYBIND11_MODULE(ledrx, m) {
         .def_readonly("n", &Calibration::n);
 
     py::class_<FcTelemetry>(m, "FcTelemetry")
-        .def(py::init([](const std::string& port, int baud, Mat3 mount, double latency_ms) {
+        .def(py::init([](const std::string& port, int baud, Mat3 mount, double latency_ms, double gyro_scale) {
                  py::gil_scoped_release release;
-                 return std::make_unique<FcTelemetry>(port, baud, mount, latency_ms);
+                 return std::make_unique<FcTelemetry>(port, baud, mount, latency_ms, gyro_scale);
              }),
              py::arg("port"), py::arg("baud") = 115200, py::arg("mount") = mount_matrix(0.0),
-             py::arg("latency_ms") = 0.0)
+             py::arg("latency_ms") = 0.0, py::arg("gyro_scale") = 1.0)
         .def("rotation", &FcTelemetry::rotation, py::arg("t0_ms"), py::arg("t1_ms"),
              "Camera rotation between two monotonic_ms() times, or None without gyro data.")
         .def("rotation_body", &FcTelemetry::rotation_body, py::arg("t0_ms"), py::arg("t1_ms"))
@@ -156,6 +156,7 @@ PYBIND11_MODULE(ledrx, m) {
         .def_readonly("variant", &FcTelemetry::variant)
         .def_readwrite("mount", &FcTelemetry::mount)
         .def_readwrite("latency_ms", &FcTelemetry::latency_ms)
+        .def_readwrite("gyro_scale", &FcTelemetry::gyro_scale)
         .def("close", &FcTelemetry::close, py::call_guard<py::gil_scoped_release>());
 
     m.def("monotonic_ms", &monotonic_ms, "CLOCK_MONOTONIC in ms (the clock of picamera2 SensorTimestamp).");
