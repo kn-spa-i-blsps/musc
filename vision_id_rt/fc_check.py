@@ -54,7 +54,9 @@ def load_mount():
 
 
 def find_port():
-    ports = sorted(glob.glob("/dev/ttyACM*"))
+    """A /dev/serial/by-id path when there is one: it survives the FC re-enumerating after a USB reset."""
+    ports = sorted(glob.glob("/dev/serial/by-id/*Betaflight*") + glob.glob("/dev/serial/by-id/*INAV*"))
+    ports += sorted(glob.glob("/dev/ttyACM*"))
     if not ports:
         raise SystemExit("No flight controller on USB (/dev/ttyACM*). Use --port for a UART, e.g. /dev/ttyAMA0.")
     return ports[0]

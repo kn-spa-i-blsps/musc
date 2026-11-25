@@ -97,16 +97,21 @@ PYBIND11_MODULE(ledrx, m) {
         });
 
     py::class_<Receiver>(m, "Receiver")
-        .def(py::init([](double chip_hz, bool motion_comp, bool constellations, double hfov_deg) {
+        .def(py::init([](double chip_hz, bool motion_comp, bool constellations, double hfov_deg, double snap_px,
+                         double search_grow, size_t max_tracks) {
                  Config cfg;
                  cfg.chip_hz = chip_hz;
                  cfg.motion_comp = motion_comp;
                  cfg.constellations = constellations;
                  cfg.hfov_deg = hfov_deg;
+                 cfg.snap_px = snap_px;
+                 cfg.search_grow = search_grow;
+                 cfg.max_tracks = max_tracks;
                  return Receiver(cfg);
              }),
              py::arg("chip_hz") = 20.0, py::arg("motion_comp") = false, py::arg("constellations") = true,
-             py::arg("hfov_deg") = 65.0)
+             py::arg("hfov_deg") = 65.0, py::arg("snap_px") = Config{}.snap_px,
+             py::arg("search_grow") = Config{}.search_grow, py::arg("max_tracks") = Config{}.max_tracks)
         .def("process", &process, py::arg("frame"), py::arg("ts_ms"), py::arg("cam_rot") = py::none(),
              "Process one BGR frame (HxWx3 uint8, rows may be padded). cam_rot: camera rotation since the "
              "previous frame (rotation vector in camera axes, rad), e.g. FcTelemetry.rotation().")

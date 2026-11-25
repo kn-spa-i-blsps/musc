@@ -75,9 +75,13 @@ public:
 
 private:
     std::optional<std::vector<uint8_t>> request(int cmd, double timeout_s = 0.1);
+    bool open_port();
     void run();
 
+    std::string port_;
+    int baud_;
     int fd_ = -1;
+    bool broken_ = false;
     int attitude_every_;
     std::vector<uint8_t> buf_;
     GyroIntegrator gyro_;

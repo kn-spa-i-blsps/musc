@@ -287,6 +287,9 @@ def main():
     ap.add_argument("--fc-latency", type=float, help="image delay behind the gyro [ms] (default: fc_mount.json)")
     ap.add_argument("--fc-calibrate", type=float, metavar="SECONDS", help="find the FC mounting and latency, then exit")
     ap.add_argument("--hfov", type=float, default=65.0, help="horizontal field of view [deg]")
+    ap.add_argument("--snap-px", type=float, default=20.0, help="LED search window around the prediction [px]")
+    ap.add_argument("--search-grow", type=float, default=0.08, help="window growth while the LED is not seen [px/ms]")
+    ap.add_argument("--max-tracks", type=int, default=24)
     args = ap.parse_args()
 
     # Background jobs start with SIGINT ignored; make Ctrl+C and SIGTERM both stop and save.
@@ -345,12 +348,15 @@ def main():
         serve(args.port, preview, status, set_exposure, lambda: clip.update(requested=True))
         print(f"preview: http://{__import__('socket').gethostname()}.local:{args.port}")
 
-    rx = ledrx.Receiver(args.chip_hz, motion_comp=args.motion_comp, hfov_deg=args.hfov)
+    rx = ledrx.Receiver(args.chip_hz, motion_comp=args.motion_comp, hfov_deg=args.hfov, snap_px=args.snap_px,
+                        search_grow=args.search_grow, max_tracks=args.max_tracks)
     prev_abs = None
     frames = np.empty((n_ring, H, W, 3), np.uint8) if n_ring else None
     ring_ts = np.full(n_ring, np.nan)
     log = deque(maxlen=max(n_ring, 1))
-    info = {"size": [W, H], "fps_set": FPS, "arduino": transmitter, "source": "live.py"}
+    info = {"size": [W, H], "fps_set": FPS, "arduino": transmitter, "source": "live.py",
+            "settings": {"snap_px": args.snap_px, "search_grow": args.search_grow, "max_tracks": args.max_tracks,
+                         "fc": bool(fc), "motion_comp": args.motion_comp}}
 
     def saving():
         return clip["thread"] is not None and clip["thread"].is_alive()

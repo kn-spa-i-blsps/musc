@@ -119,19 +119,27 @@ speed_t baud_constant(int baud) {
 
 }  // namespace
 
-FcTelemetry::FcTelemetry(const std::string& port, int baud, Mat3 m, double latency, double scale, int attitude_every)
-    : mount(m), latency_ms(latency), gyro_scale(scale), attitude_every_(attitude_every) {
-    fd_ = ::open(port.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (fd_ < 0) throw std::runtime_error("cannot open " + port + ": " + std::strerror(errno));
+bool FcTelemetry::open_port() {
+    if (fd_ >= 0) ::close(fd_);
+    fd_ = ::open(port_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd_ < 0) return false;
     termios tio{};
     tcgetattr(fd_, &tio);
     cfmakeraw(&tio);
-    cfsetispeed(&tio, baud_constant(baud));
-    cfsetospeed(&tio, baud_constant(baud));
+    cfsetispeed(&tio, baud_constant(baud_));
+    cfsetospeed(&tio, baud_constant(baud_));
     tio.c_cflag |= CLOCAL | CREAD;
     tcsetattr(fd_, TCSANOW, &tio);
     usleep(100000);
     tcflush(fd_, TCIFLUSH);
+    buf_.clear();
+    broken_ = false;
+    return true;
+}
+
+FcTelemetry::FcTelemetry(const std::string& port, int baud, Mat3 m, double latency, double scale, int attitude_every)
+    : mount(m), latency_ms(latency), gyro_scale(scale), port_(port), baud_(baud), attitude_every_(attitude_every) {
+    if (!open_port()) throw std::runtime_error("cannot open " + port + ": " + std::strerror(errno));
     auto got = request(MSP_FC_VARIANT);
     if (!got) {
         ::close(fd_);
@@ -155,12 +163,19 @@ void FcTelemetry::close() {
 
 std::optional<std::vector<uint8_t>> FcTelemetry::request(int cmd, double timeout_s) {
     auto frame = msp_frame(cmd);
-    if (::write(fd_, frame.data(), frame.size()) != static_cast<ssize_t>(frame.size())) return std::nullopt;
+    if (::write(fd_, frame.data(), frame.size()) != static_cast<ssize_t>(frame.size())) {
+        broken_ = true;
+        return std::nullopt;
+    }
     double end = monotonic_ms() + timeout_s * 1000;
     uint8_t chunk[256];
     while (monotonic_ms() < end) {
         pollfd p{fd_, POLLIN, 0};
         if (poll(&p, 1, 5) > 0) {
+            if (p.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                broken_ = true;
+                return std::nullopt;
+            }
             ssize_t n = ::read(fd_, chunk, sizeof chunk);
             if (n > 0) buf_.insert(buf_.end(), chunk, chunk + n);
         }
@@ -181,6 +196,12 @@ void FcTelemetry::run() {
     long k = 0;
     auto i16 = [](const std::vector<uint8_t>& b, size_t i) { return static_cast<int16_t>(b[i] | b[i + 1] << 8); };
     while (running_) {
+        if (broken_) {
+            // USB reset or unplugged: wait and reopen; a /dev/serial/by-id path follows the new device node.
+            usleep(500000);
+            if (running_) open_port();
+            continue;
+        }
         double t_send = monotonic_ms();
         auto raw = request(MSP_RAW_IMU);
         if (!raw || raw->size() < 12) {
