@@ -97,8 +97,8 @@ inline void vblur_energy_row(const uint16_t* const r[5], float* en, int w, bool 
 }
 
 // |cur - prev * gain| blurred horizontally with [1 4 6 4 1] / 16.
-inline void scaled_absdiff_hblur_row(const uint8_t* cur, const uint8_t* prev, float gain, float* d, float* out,
-                                     int w) {
+template <class P>
+inline void scaled_absdiff_hblur_row(const uint8_t* cur, const P* prev, float gain, float* d, float* out, int w) {
     for (int x = 0; x < w; ++x) {
         float v = cur[x] - prev[x] * gain;
         d[x] = v < 0 ? -v : v;

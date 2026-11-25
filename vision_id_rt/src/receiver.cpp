@@ -13,7 +13,6 @@ namespace ledrx {
 namespace {
 
 constexpr size_t LEVELS_LEN = 90;
-constexpr size_t OBS_LEN = 40;
 constexpr size_t MAX_PEAKS = 60;
 constexpr double LOST_KEEP_MS = 800.0;
 
@@ -34,7 +33,80 @@ Window window(int cx, int cy, int r, int w, int h) {
 
 }  // namespace
 
-Receiver::Receiver(Config cfg) : cfg_(cfg) {}
+Receiver::Receiver(Config cfg)
+    : cfg_(cfg), grouper_(CHIPS * cfg.chip_ms(), cfg.chip_ms(), cfg.cs_min_events, cfg.group_radius_px, 0.5,
+                          cfg.cs_near_weight) {}
+
+// ------------------------------------------------------------------ camera motion
+
+void Receiver::warp_history(const Homography& H) {
+    const size_t n = static_cast<size_t>(w_) * h_;
+    if (have_feat_) {
+        prev_warped_.resize(n);
+        if (have_warped_) {
+            scratch_.resize(n);
+            warp(prev_warped_.data(), scratch_.data(), w_, h_, H, true);
+            prev_warped_.swap(scratch_);
+        } else {
+            warp(feat_.data(), prev_warped_.data(), w_, h_, H, true);
+        }
+        have_warped_ = true;
+    }
+    if (have_energy_) {
+        scratch_.resize(n);
+        warp(energy_.data(), scratch_.data(), w_, h_, H, false);
+        energy_.swap(scratch_);
+    }
+}
+
+// The gyro gives the camera rotation directly, so this works on a plain sky where the image has nothing to lock on.
+void Receiver::compensate_rotation(const double rot[3]) {
+    Homography H = rotation_homography(rot, w_, h_, cfg_.hfov_deg);
+    const double pts[5][2] = {{0, 0}, {double(w_), 0}, {0, double(h_)}, {double(w_), double(h_)}, {w_ / 2.0, h_ / 2.0}};
+    double moved = 0;
+    for (const auto& p : pts) {
+        double x, y;
+        H.apply(p[0], p[1], x, y);
+        moved = std::max({moved, std::fabs(x - p[0]), std::fabs(y - p[1])});
+    }
+    double cx, cy;
+    H.apply(w_ / 2.0, h_ / 2.0, cx, cy);
+    motion_[0] = cx - w_ / 2.0;
+    motion_[1] = cy - h_ / 2.0;
+    if (moved < 0.3) {
+        motion_[0] = motion_[1] = 0;
+        return;
+    }
+    warp_history(H);
+    phase_.reset();
+    for (auto& t : tracks_) {
+        double x, y;
+        H.apply(t->kf.x[0], t->kf.x[1], x, y);
+        t->kf.shift(x - t->kf.x[0], y - t->kf.x[1]);
+        t->x = t->kf.x[0];
+        t->y = t->kf.x[1];
+    }
+    for (Lost& l : lost_) H.apply(l.x, l.y, l.x, l.y);
+}
+
+void Receiver::compensate_shift(const uint8_t* bgr, size_t stride) {
+    motion_[0] = motion_[1] = 0;
+    double dx, dy, response;
+    if (!phase_.update(bgr, w_, h_, stride, dx, dy, response)) return;
+    if (response < 0.2 || std::fabs(dx) > w_ / 10.0 || std::fabs(dy) > h_ / 10.0 ||
+        (std::fabs(dx) < 0.5 && std::fabs(dy) < 0.5))
+        return;
+    motion_[0] = dx;
+    motion_[1] = dy;
+    warp_history(Homography::translation(dx, dy));
+    for (auto& t : tracks_) {
+        t->kf.shift(dx, dy);
+        t->x = t->kf.x[0];
+        t->y = t->kf.x[1];
+    }
+}
+
+// ------------------------------------------------------------------ blink energy
 
 void Receiver::update_feature_and_energy(const uint8_t* bgr, size_t stride) {
     const int w = w_, h = h_;
@@ -46,7 +118,7 @@ void Receiver::update_feature_and_energy(const uint8_t* bgr, size_t stride) {
     prev_feat_.swap(feat_);
     candidates_.clear();
     const float gain = exposure_gain(bgr, stride);
-    const bool exact = gain == 1.0f;
+    const bool exact = gain == 1.0f && !have_warped_;
 
     // One pass over rows: feature and horizontal blur run two rows ahead of the vertical blur.
     auto slot = [&](int y) { return static_cast<size_t>(y % HBLUR_ROWS) * w; };
@@ -56,6 +128,9 @@ void Receiver::update_feature_and_energy(const uint8_t* bgr, size_t stride) {
         nonblue_row(bgr + y * stride, cur, w);
         if (exact)
             absdiff_hblur_row(cur, prev, diff_.data(), hblur_.data() + slot(y), w);
+        else if (have_warped_)
+            scaled_absdiff_hblur_row(cur, prev_warped_.data() + static_cast<size_t>(y) * w, gain, fdiff_.data(),
+                                     fhblur_.data() + slot(y), w);
         else
             scaled_absdiff_hblur_row(cur, prev, gain, fdiff_.data(), fhblur_.data() + slot(y), w);
     };
@@ -77,6 +152,7 @@ void Receiver::update_feature_and_energy(const uint8_t* bgr, size_t stride) {
         }
     }
     have_energy_ = true;
+    have_warped_ = false;
 }
 
 // Auto exposure changes the whole image at once; without compensation every edge would blink.
@@ -86,8 +162,10 @@ float Receiver::exposure_gain(const uint8_t* bgr, size_t stride) const {
         const uint8_t* row = bgr + y * stride;
         for (int x = 0; x < w_; x += 8) {
             int b = row[3 * x], g = row[3 * x + 1], r = row[3 * x + 2];
-            int c = std::max(std::max(r, g) - b, 0), p = prev_feat_[static_cast<size_t>(y) * w_ + x];
-            if (c > 20 && c < 235 && p > 20 && p < 235) ratios.push_back(static_cast<float>(c) / p);
+            float c = static_cast<float>(std::max(std::max(r, g) - b, 0));
+            size_t i = static_cast<size_t>(y) * w_ + x;
+            float p = have_warped_ ? prev_warped_[i] : prev_feat_[i];
+            if (c > 20 && c < 235 && p > 20 && p < 235) ratios.push_back(c / p);
         }
     }
     if (ratios.size() <= 100) return 1.0f;
@@ -137,34 +215,62 @@ void Receiver::find_peaks() {
     if (peaks_.size() > MAX_PEAKS) peaks_.resize(MAX_PEAKS);
 }
 
+// ------------------------------------------------------------------ tracking
+
+// The LED is dark for about one chip; without prediction the track would look for it where it went dark.
 void Receiver::predict(double ts, double dt) {
-    if (dt <= 0) return;
-    for (auto& t : tracks_)
-        if (ts - t->last_seen_ts < cfg_.cv_max_gap_ms) {
-            t->x += t->vx * dt;
-            t->y += t->vy * dt;
-        }
+    for (auto& t : tracks_) {
+        if (ts - t->last_seen_ts >= cfg_.kf_coast_ms) t->kf.stop();
+        t->kf.predict(dt);
+        t->x = t->kf.x[0];
+        t->y = t->kf.x[1];
+    }
 }
 
-void Receiver::snap_and_spawn(double ts) {
-    std::vector<Track*> order;
-    for (auto& t : tracks_) order.push_back(t.get());
-    std::stable_sort(order.begin(), order.end(), [](Track* a, Track* b) { return a->created_ts < b->created_ts; });
+void Receiver::correct(Track& t, double zx, double zy, double meas_std) {
+    t.kf.correct(zx, zy, meas_std);
+    t.kf.clamp_speed(cfg_.max_px_per_ms);
+    t.x = t.kf.x[0];
+    t.y = t.kf.x[1];
+}
+
+double Receiver::reach(const Track& t, double ts) const {
+    double grow = std::max(cfg_.search_grow * (ts - t.last_seen_ts), cfg_.kf_gate_sigma * t.kf.pos_std());
+    return cfg_.snap_px + t.radius + std::min(grow, 60.0);
+}
+
+void Receiver::assign_and_spawn(double ts) {
     std::vector<bool> used(peaks_.size(), false);
-    for (Track* t : order) {
-        double reach = cfg_.snap_px + t->radius + std::min(cfg_.search_grow * (ts - t->last_seen_ts), 60.0);
-        int best = -1;
-        for (size_t i = 0; i < peaks_.size(); ++i) {
-            if (used[i] || std::hypot(peaks_[i].x - t->x, peaks_[i].y - t->y) > reach) continue;
-            if (best < 0 || peaks_[i].energy > peaks_[best].energy) best = static_cast<int>(i);
+    const int nt = static_cast<int>(tracks_.size()), np = static_cast<int>(peaks_.size());
+    if (nt && np) {
+        // Cost: (distance from the prediction / gate)^2 minus a bonus for stronger peaks; outside the gate forbidden.
+        constexpr double BIG = 1e6;
+        double emax = 0;
+        for (const Peak& p : peaks_) emax = std::max(emax, p.energy);
+        std::vector<double> cost(static_cast<size_t>(nt) * np);
+        std::vector<char> gate(cost.size());
+        bool any = false;
+        for (int i = 0; i < nt; ++i) {
+            const Track& t = *tracks_[i];
+            double r = reach(t, ts);
+            for (int j = 0; j < np; ++j) {
+                double d = std::hypot(t.x - peaks_[j].x, t.y - peaks_[j].y);
+                size_t k = static_cast<size_t>(i) * np + j;
+                gate[k] = d <= r;
+                any |= gate[k] != 0;
+                cost[k] = gate[k] ? (d / r) * (d / r) - cfg_.assign_energy_w * (peaks_[j].energy / emax) : BIG;
+            }
         }
-        if (best < 0) continue;
-        used[best] = true;
-        const Peak& p = peaks_[best];
-        t->x += cfg_.snap_gain * (p.x - t->x);
-        t->y += cfg_.snap_gain * (p.y - t->y);
-        t->radius = 0.9 * t->radius + 0.1 * std::max(p.radius, 1.0);
-        t->last_seen_ts = ts;
+        if (any)
+            for (auto [ti, pi] : hungarian(cost, nt, np)) {
+                if (!gate[static_cast<size_t>(ti) * np + pi]) continue;
+                used[pi] = true;
+                Track& t = *tracks_[ti];
+                const Peak& p = peaks_[pi];
+                correct(t, p.x, p.y, cfg_.kf_peak_px);
+                t.radius = 0.9 * t.radius + 0.1 * std::max(p.radius, 1.0);
+                t.last_seen_ts = ts;
+            }
     }
 
     for (size_t i = 0; i < peaks_.size(); ++i) {
@@ -276,40 +382,6 @@ void Receiver::lock_point(Track& t, double ts) {
     t.last_seen_ts = ts;
 }
 
-void Receiver::update_velocity(Track& t, double ts) {
-    if (t.last_seen_ts == ts) push_capped(t.obs, {ts, t.x, t.y}, OBS_LEN);
-    std::vector<Track::Obs> pts;
-    for (const auto& o : t.obs)
-        if (ts - o.ts <= cfg_.cv_window_ms) pts.push_back(o);
-    if (pts.size() < 3 || pts.back().ts - pts.front().ts < 3 * frame_dt_) {
-        t.vx = t.vy = 0.0;
-        return;
-    }
-    double mt = 0, mx = 0, my = 0;
-    for (const auto& o : pts) {
-        mt += o.ts;
-        mx += o.x;
-        my += o.y;
-    }
-    mt /= pts.size();
-    mx /= pts.size();
-    my /= pts.size();
-    double den = 0, nx = 0, ny = 0;
-    for (const auto& o : pts) {
-        double dt = o.ts - mt;
-        den += dt * dt;
-        nx += dt * (o.x - mx);
-        ny += dt * (o.y - my);
-    }
-    double vx = nx / den, vy = ny / den, sp = std::hypot(vx, vy);
-    if (sp > cfg_.cv_max_px_per_ms) {
-        vx *= cfg_.cv_max_px_per_ms / sp;
-        vy *= cfg_.cv_max_px_per_ms / sp;
-    }
-    t.vx = vx;
-    t.vy = vy;
-}
-
 double Receiver::sample(Track& t) {
     int r = std::min(std::max(py_round(t.radius) + cfg_.sample_pad, 2), cfg_.sample_max);
     Window win = window(py_round(t.x), py_round(t.y), r, w_, h_);
@@ -325,7 +397,9 @@ double Receiver::sample(Track& t) {
         level = static_cast<double>(sum) / ((win.x1 - win.x0) * (win.y1 - win.y0));
     }
     push_capped(t.levels, level, LEVELS_LEN);
-    if (t.levels.size() >= 6 && (t.levels.size() % 3 == 0 || !t.has_lohi)) {
+    // Young tracks update the threshold every frame, so the first dark chip already gives a state.
+    size_t n = t.levels.size();
+    if (n >= 6 && (n % 3 == 0 || n < 30 || !t.has_lohi)) {
         std::vector<double> v(t.levels.begin(), t.levels.end());
         percentiles(v, 10, 90, t.lo, t.hi);
         t.has_lohi = true;
@@ -338,7 +412,9 @@ void Receiver::update_id(Track& t, double ts) {
     const double frame_ms = CHIPS * cfg_.chip_ms();
     TemplateDecoder& dec = t.decoder;
     bool fresh = ts - dec.last_ok_ts < 1.5 * frame_ms;
-    if (t.synced_with) {
+    if (cfg_.constellations) {
+        t.synced_with = 0;
+    } else if (t.synced_with) {
         if (dec.last_id != NO_ID && fresh && dec.last_id != t.drone_id)
             t.synced_with = 0;
         else
@@ -360,8 +436,85 @@ void Receiver::update_id(Track& t, double ts) {
     }
 }
 
-// A track blinking exactly like a confirmed one is the same light (LED and its reflection, or
-// the LED re-acquired) and takes its ID without waiting for a full read.
+// Groups tracks by blinking (BlinkGrouper) and shares IDs inside a group: a track without its own confirmed
+// read takes the group's ID from the other tracks' reads.
+void Receiver::constellate(double ts) {
+    const double frame_ms = CHIPS * cfg_.chip_ms();
+    grouper_.radius_px = cfg_.group_radius_px;
+    std::vector<int> tids, states;
+    std::vector<double> xy;
+    for (auto& t : tracks_) {
+        tids.push_back(t->tid);
+        xy.push_back(t->x);
+        xy.push_back(t->y);
+        states.push_back(t->cs_state);
+    }
+    std::map<int, int> gids = grouper_.update(ts, tids, xy, states);
+
+    std::vector<int> order;
+    std::map<int, std::vector<Track*>> groups;
+    for (auto& t : tracks_) {
+        t->gid = gids[t->tid];
+        if (!groups.count(t->gid)) order.push_back(t->gid);
+        groups[t->gid].push_back(t.get());
+    }
+    for (auto it = group_since_.begin(); it != group_since_.end();) {
+        auto g = groups.find(it->first);
+        it = g != groups.end() && g->second.size() >= 2 ? std::next(it) : group_since_.erase(it);
+    }
+    constellations_.clear();
+    auto own = [](const Track* t) {
+        const TemplateDecoder& d = t->decoder;
+        return d.confirmed_id != NO_ID && d.last_id == d.confirmed_id ? d.confirmed_id : NO_ID;
+    };
+    for (int gid : order) {
+        auto& members = groups[gid];
+        if (members.size() < 2) continue;
+        double since = group_since_.emplace(gid, ts).first->second;
+
+        // Two tracks that confirmed different IDs are not one constellation.
+        std::vector<std::pair<Track*, int>> conf;
+        for (Track* t : members)
+            if (own(t) != NO_ID) conf.emplace_back(t, own(t));
+        for (size_t a = 0; a < conf.size(); ++a)
+            for (size_t b = a + 1; b < conf.size(); ++b)
+                if (conf[a].second != conf[b].second) grouper_.block(conf[a].first->tid, conf[b].first->tid);
+
+        std::map<int, int> votes;
+        for (auto& c : conf) ++votes[c.second];
+        bool confirmed = !votes.empty();
+        if (votes.empty())
+            for (Track* t : members) {
+                const TemplateDecoder& d = t->decoder;
+                if (d.last_id != NO_ID && ts - d.last_ok_ts < 1.5 * frame_ms) ++votes[d.last_id];
+            }
+        int group_id = NO_ID;
+        for (auto& [id, n] : votes)
+            if (group_id == NO_ID || n > votes[group_id]) group_id = id;
+        if (!confirmed && group_id != NO_ID && cfg_.cs_confirm_votes > 0 && votes[group_id] >= cfg_.cs_confirm_votes)
+            confirmed = true;
+        if (group_id != NO_ID)
+            for (Track* t : members)
+                if (own(t) == NO_ID &&
+                    (t->drone_id != group_id || t->id_confirmed != confirmed || t->inherited())) {
+                    t->drone_id = group_id;
+                    t->id_confirmed = confirmed;
+                    t->inherited_ts = NAN;
+                    t->synced_with = gid;
+                }
+        Constellation c{gid, {}, 0, 0, since, group_id, confirmed};
+        for (Track* t : members) {
+            c.track_ids.push_back(t->tid);
+            c.x += t->x;
+            c.y += t->y;
+        }
+        c.x /= members.size();
+        c.y /= members.size();
+        constellations_.push_back(std::move(c));
+    }
+}
+
+// Without constellations: a track blinking exactly like a confirmed one takes its ID.
 void Receiver::adopt_synced_ids(double ts) {
     size_t n = static_cast<size_t>(0.6 * CHIPS * cfg_.chip_ms() / std::max(frame_dt_, 1.0));
     if (n < 2) return;
@@ -406,8 +559,7 @@ void Receiver::adopt_synced_ids(double ts) {
 bool Receiver::still_blinking(const Track& t, double ts) const {
     size_t n = static_cast<size_t>(1000.0 / std::max(frame_dt_, 1.0));
     if (ts - t.created_ts < 1000.0 || t.levels.size() < n) return true;
-    auto first = t.levels.end() - n;
-    auto [lo, hi] = std::minmax_element(first, t.levels.end());
+    auto [lo, hi] = std::minmax_element(t.levels.end() - n, t.levels.end());
     return *hi - *lo >= cfg_.min_contrast;
 }
 
@@ -422,15 +574,17 @@ void Receiver::drop_lost(double ts) {
     }
     tracks_.swap(alive);
 
-    std::set<int> live_tids;
-    for (auto& t : tracks_) live_tids.insert(t->tid);
-    for (auto& t : tracks_) {
-        // ID 0 counts as unconfirmed here, as in the reference implementation.
-        bool unconfirmed = t->decoder.confirmed_id == NO_ID || t->decoder.confirmed_id == 0;
-        if (t->synced_with && !live_tids.count(t->synced_with) && unconfirmed) {
-            t->synced_with = 0;
-            t->id_confirmed = false;
-            t->inherited_ts = ts;
+    if (!cfg_.constellations) {
+        std::set<int> live_tids;
+        for (auto& t : tracks_) live_tids.insert(t->tid);
+        for (auto& t : tracks_) {
+            // `not decoder.confirmed_id` in the reference implementation is also true for ID 0.
+            bool unconfirmed = t->decoder.confirmed_id == NO_ID || t->decoder.confirmed_id == 0;
+            if (t->synced_with && !live_tids.count(t->synced_with) && unconfirmed) {
+                t->synced_with = 0;
+                t->id_confirmed = false;
+                t->inherited_ts = ts;
+            }
         }
     }
     lost_.erase(std::remove_if(lost_.begin(), lost_.end(), [ts](const Lost& l) { return ts - l.ts >= LOST_KEEP_MS; }),
@@ -501,7 +655,8 @@ std::vector<Drone> Receiver::group(double ts) {
     return drones;
 }
 
-std::vector<Drone> Receiver::process(const uint8_t* bgr, int width, int height, size_t stride, double ts) {
+std::vector<Drone> Receiver::process(const uint8_t* bgr, int width, int height, size_t stride, double ts,
+                                     const double* cam_rot) {
     if (width != w_ || height != h_) {
         w_ = width;
         h_ = height;
@@ -513,31 +668,59 @@ std::vector<Drone> Receiver::process(const uint8_t* bgr, int width, int height, 
         fdiff_.assign(w_, 0.0f);
         fhblur_.assign(static_cast<size_t>(HBLUR_ROWS) * w_, 0.0f);
         energy_.assign(n, 0.0f);
-        have_feat_ = have_energy_ = false;
+        have_feat_ = have_energy_ = have_warped_ = false;
+        phase_.reset();
         tracks_.clear();
     }
-    update_feature_and_energy(bgr, stride);
-
     double dt = std::isnan(last_ts_) ? 0.0 : ts - last_ts_;
     last_ts_ = ts;
     if (dt > 0) frame_dt_ = 0.9 * frame_dt_ + 0.1 * dt;
 
+    if (cam_rot)
+        compensate_rotation(cam_rot);
+    else if (cfg_.motion_comp)
+        compensate_shift(bgr, stride);
     predict(ts, dt);
+    update_feature_and_energy(bgr, stride);
     find_peaks();
-    snap_and_spawn(ts);
+    assign_and_spawn(ts);
+
     for (auto& tp : tracks_) {
         Track& t = *tp;
+        // The exact source position, when visible, is a second and sharper Kalman measurement.
+        double x0 = t.x, y0 = t.y;
         seek_source(t);
         lock_point(t, ts);
-        update_velocity(t, ts);
+        if (t.x != x0 || t.y != y0) correct(t, t.x, t.y, cfg_.kf_fine_px);
         double level = sample(t);
         push_capped<uint8_t>(t.states, t.has_lohi && level > 0.5 * (t.lo + t.hi), LEVELS_LEN);
+        t.cs_state = 0;
+        if (t.has_lohi && t.contrast >= cfg_.min_contrast) {
+            double rel = (level - 0.5 * (t.lo + t.hi)) / (0.5 * t.contrast);
+            t.cs_state = rel > cfg_.cs_margin ? 1 : rel < -cfg_.cs_margin ? -1 : 0;
+        }
         t.decoder.push(ts, level);
         update_id(t, ts);
     }
-    adopt_synced_ids(ts);
+    if (cfg_.constellations)
+        constellate(ts);
+    else if (cfg_.sync_adopt)
+        adopt_synced_ids(ts);
     drop_lost(ts);
     dedupe();
+    if (cfg_.constellations) {
+        std::set<int> live;
+        for (auto& t : tracks_) live.insert(t->tid);
+        std::vector<Constellation> kept;
+        for (auto& c : constellations_) {
+            std::vector<int> ids;
+            for (int id : c.track_ids)
+                if (live.count(id)) ids.push_back(id);
+            c.track_ids = ids;
+            if (c.track_ids.size() >= 2) kept.push_back(std::move(c));
+        }
+        constellations_.swap(kept);
+    }
     return group(ts);
 }
 

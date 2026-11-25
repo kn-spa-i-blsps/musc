@@ -1,4 +1,5 @@
-// Finds blinking LEDs, tracks them, decodes their IDs and groups LEDs with the same ID into drones.
+// Finds blinking LEDs, tracks them (Kalman filter + Hungarian assignment), groups tracks blinking the
+// same code into constellations, decodes IDs and reports drones with their bearing.
 // Coordinates are in input image pixels.
 #pragma once
 #include <cmath>
@@ -8,7 +9,10 @@
 #include <memory>
 #include <vector>
 
+#include "constellation.hpp"
 #include "decoder.hpp"
+#include "motion.hpp"
+#include "tracking.hpp"
 
 namespace ledrx {
 
@@ -19,12 +23,10 @@ struct Config {
     float energy_decay = 0.95f;
     int peak_nms_px = 11;
     double snap_px = 20.0;
-    double snap_gain = 0.4;
     double min_track_sep_px = 30.0;
     double lost_ms = 1000.0;
     double search_grow = 0.08;
     int source_search_px = 35;
-    double sync_corr = 0.85;
     double source_margin = 40.0;
     int sample_pad = 3;
     int sample_max = 12;
@@ -33,11 +35,26 @@ struct Config {
     double hfov_deg = 65.0;
     double group_radius_px = 150.0;
     double core_drop = 15.0;
-    double cv_window_ms = 300.0;
-    double cv_max_gap_ms = 250.0;
-    double cv_max_px_per_ms = 2.0;
     double point_min = 20.0;
     double point_rel = 0.5;
+    // Kalman filter (constant velocity) and assignment
+    double kf_accel = 0.01;
+    double kf_peak_px = 4.0;
+    double kf_fine_px = 1.0;
+    double kf_coast_ms = 250.0;
+    double max_px_per_ms = 2.0;
+    double assign_energy_w = 0.3;
+    double kf_gate_sigma = 0.0;
+    // Constellations: tracks blinking the same code share an ID
+    bool constellations = true;
+    double cs_min_events = 2.0;
+    double cs_near_weight = 0.5;
+    double cs_margin = 0.3;
+    int cs_confirm_votes = 2;
+    bool sync_adopt = true;  // only without constellations
+    double sync_corr = 0.85;
+    // Camera motion from the image when no gyro rotation is given
+    bool motion_comp = false;
 
     double chip_ms() const { return 1000.0 / chip_hz; }
 };
@@ -48,14 +65,15 @@ struct Peak {
 
 struct Track {
     Track(int tid, double x, double y, double ts, const Config& cfg, double radius)
-        : tid(tid), x(x), y(y), created_ts(ts), last_seen_ts(ts),
-          decoder(cfg.chip_hz, cfg.min_contrast), radius(radius) {}
+        : tid(tid), x(x), y(y), created_ts(ts), last_seen_ts(ts), decoder(cfg.chip_hz, cfg.min_contrast),
+          radius(radius), kf(x, y, cfg.kf_peak_px, 0.3, cfg.kf_accel) {}
 
     int tid;
     double x, y;
     double created_ts, last_seen_ts;
     TemplateDecoder decoder;
     double radius;
+    KalmanCV kf;
     std::deque<double> levels;
     std::deque<uint8_t> states;
     bool has_lohi = false;
@@ -67,12 +85,9 @@ struct Track {
     double on_peak = 0.0;
     int synced_with = 0;
     double core = 0.0;
-    struct Obs {
-        double ts, x, y;
-    };
-    std::deque<Obs> obs;
-    double vx = 0.0, vy = 0.0;
     double point_peak = 0.0;
+    int gid = 0;
+    int cs_state = 0;
 
     bool inherited() const { return !std::isnan(inherited_ts); }
 };
@@ -87,32 +102,51 @@ struct Drone {
     bool confirmed;
 };
 
+struct Constellation {
+    int gid;
+    std::vector<int> track_ids;
+    double x, y;
+    double since_ts;
+    int drone_id;
+    bool confirmed;
+};
+
 class Receiver {
 public:
     explicit Receiver(Config cfg = {});
 
-    // bgr: 8-bit BGR, rows `stride` bytes apart.
-    std::vector<Drone> process(const uint8_t* bgr, int width, int height, size_t stride, double ts);
+    // bgr: 8-bit BGR, rows `stride` bytes apart. cam_rot: camera rotation since the previous frame
+    // (rotation vector in camera axes, rad, e.g. from the flight controller gyro), or null.
+    std::vector<Drone> process(const uint8_t* bgr, int width, int height, size_t stride, double ts,
+                               const double* cam_rot = nullptr);
 
     const Config& config() const { return cfg_; }
     const std::vector<std::unique_ptr<Track>>& tracks() const { return tracks_; }
     const std::vector<Peak>& last_peaks() const { return peaks_; }
+    const std::vector<Constellation>& constellations() const { return constellations_; }
     const std::vector<uint8_t>& feature() const { return feat_; }
+    double last_motion_x() const { return motion_[0]; }
+    double last_motion_y() const { return motion_[1]; }
     int width() const { return w_; }
     int height() const { return h_; }
 
 private:
+    void compensate_rotation(const double rot[3]);
+    void compensate_shift(const uint8_t* bgr, size_t stride);
+    void warp_history(const Homography& H);
     void update_feature_and_energy(const uint8_t* bgr, size_t stride);
     float exposure_gain(const uint8_t* bgr, size_t stride) const;
     void find_peaks();
     void predict(double ts, double dt);
-    void snap_and_spawn(double ts);
+    void correct(Track& t, double zx, double zy, double meas_std);
+    double reach(const Track& t, double ts) const;
+    void assign_and_spawn(double ts);
     void inherit_id(Track& t, double ts);
     void seek_source(Track& t);
     void lock_point(Track& t, double ts);
-    void update_velocity(Track& t, double ts);
     double sample(Track& t);
     void update_id(Track& t, double ts);
+    void constellate(double ts);
     void adopt_synced_ids(double ts);
     bool still_blinking(const Track& t, double ts) const;
     void drop_lost(double ts);
@@ -125,13 +159,17 @@ private:
     Config cfg_;
     int w_ = 0, h_ = 0;
     std::vector<uint8_t> feat_, prev_feat_, diff_;
+    std::vector<float> prev_warped_;  // previous feature after camera motion compensation
+    bool have_warped_ = false;
     static constexpr int HBLUR_ROWS = 8;
     std::vector<uint16_t> hblur_;
     std::vector<float> fdiff_, fhblur_;
-    std::vector<float> energy_;
+    std::vector<float> energy_, scratch_;
     bool have_feat_ = false, have_energy_ = false;
     std::vector<uint32_t> candidates_;
     std::vector<Peak> peaks_;
+    PhaseCorrelator phase_;
+    double motion_[2] = {0, 0};
 
     std::vector<std::unique_ptr<Track>> tracks_;
     int next_tid_ = 1;
@@ -143,6 +181,9 @@ private:
     };
     std::vector<Lost> lost_;
     std::map<int, std::pair<double, double>> src_core_;
+    BlinkGrouper grouper_;
+    std::vector<Constellation> constellations_;
+    std::map<int, double> group_since_;
 };
 
 }  // namespace ledrx

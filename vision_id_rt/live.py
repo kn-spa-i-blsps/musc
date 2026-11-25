@@ -1,11 +1,18 @@
 """Live LED ID decoding from the Pi camera at 60 fps with the C++ receiver.
 
-    python3 live.py [--seconds 30] [--exposure 250] [--keep 10] [--port 8000] [--no-flip]
+    python3 live.py [--seconds 30] [--exposure 250] [--keep 15] [--port 8000] [--no-flip]
+    python3 live.py --fc                      # camera rotation from the flight controller gyro
+    python3 live.py --fc --fc-calibrate 15    # find how the FC is mounted relative to the camera
 
 Open http://<pi>:8000 for the preview with the decoder overlay. Stats are also printed once a
 second. The page's "Save" button (and Ctrl+C or SIGTERM) saves the last --keep seconds to
 ~/recordings/live_<time>/: raw.avi + ts.npy + info.json (replay with `build/ledrx_rec DIR`) and
 log.jsonl with what the decoder saw in every frame (drones and tracks with their signal level).
+
+With --fc the flight controller gyro (MSP over USB, /dev/ttyACM*) tells the receiver how the camera
+turned between frames. --fc-calibrate: point the camera at a still scene with detail and turn it
+up/down and left/right for the given seconds; the mounting and latency are saved to fc_mount.json
+and used from then on. fc_check.py shows the gyro in camera axes to check the mounting by hand.
 """
 import argparse
 import json
@@ -26,9 +33,11 @@ from picamera2 import MappedArray, Picamera2
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "build"))
 import ledrx  # noqa: E402
+from fc_check import MOUNT_FILE, find_port, format_mount, load_mount, parse_mount  # noqa: E402
 
 W, H, FPS = 1332, 990, 60
 PREVIEW_W, PREVIEW_EVERY = 888, 4
+GROUP_COLORS = [(255, 180, 0), (255, 0, 255), (0, 128, 255), (255, 255, 0), (180, 105, 255), (0, 255, 180)]
 GAMMA = np.array([min(255, int(255 * (i / 255) ** 0.45)) for i in range(256)], np.uint8)
 
 PAGE = """<!doctype html>
@@ -98,10 +107,10 @@ class Preview:
         self.seq = 0
         threading.Thread(target=self._loop, daemon=True).start()
 
-    def offer(self, frame, tracks, drones, peaks):
+    def offer(self, frame, tracks, drones, peaks, groups):
         with self.cond:
             if self.pending is None:
-                self.pending = (frame.copy(), tracks, drones, peaks)
+                self.pending = (frame.copy(), tracks, drones, peaks, groups)
                 self.cond.notify_all()
 
     def wait_jpeg(self, seen):
@@ -113,8 +122,8 @@ class Preview:
         while True:
             with self.cond:
                 self.cond.wait_for(lambda: self.pending is not None)
-                frame, tracks, drones, peaks = self.pending
-            img = self._draw(frame, tracks, drones, peaks)
+                frame, tracks, drones, peaks, groups = self.pending
+            img = self._draw(frame, tracks, drones, peaks, groups)
             jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
             with self.cond:
                 self.jpeg, self.pending = jpeg, None
@@ -122,7 +131,7 @@ class Preview:
                 self.cond.notify_all()
 
     @staticmethod
-    def _draw(frame, tracks, drones, peaks):
+    def _draw(frame, tracks, drones, peaks, groups):
         s = PREVIEW_W / frame.shape[1]
         img = cv2.LUT(cv2.resize(frame, (PREVIEW_W, int(frame.shape[0] * s)), interpolation=cv2.INTER_AREA), GAMMA)
         for x, y, _ in peaks:
@@ -135,6 +144,16 @@ class Preview:
             cv2.circle(img, p, int(max(6, 2 * t["radius"] * s)), color, 1)
             bits = "".join(map(str, t["states"][-24:]))
             cv2.putText(img, bits, (p[0] + 10, p[1] + 4), cv2.FONT_HERSHEY_PLAIN, 0.8, color, 1)
+        pos = {t["tid"]: (int(t["x"] * s), int(t["y"] * s)) for t in tracks}
+        for g in groups:
+            col = GROUP_COLORS[g["gid"] % len(GROUP_COLORS)]
+            pts = [pos[k] for k in g["track_ids"] if k in pos]
+            for a in range(len(pts)):
+                for b in range(a + 1, len(pts)):
+                    cv2.line(img, pts[a], pts[b], col, 1)
+            if g["drone_id"] is None and pts:
+                cv2.putText(img, f"K{g['gid']} ({len(pts)})", (int(g["x"] * s) + 12, int(g["y"] * s) - 12),
+                            cv2.FONT_HERSHEY_PLAIN, 1.0, col, 1)
         for d in drones:
             c = (int(d.x * s), int(d.y * s))
             r = int(max(20, d.spread_px * s / 2 + 15))
@@ -217,6 +236,42 @@ def save_clip(out: Path, frames, ring_ts, entries, info):
     return out
 
 
+def calibrate(cam, fc, seconds, hfov):
+    cam.set_controls({"AeEnable": True, "AwbEnable": True})
+    time.sleep(1.0)
+    print(f"Calibrating for {seconds:g} s: point the camera at a still scene with detail and turn it "
+          "up/down and left/right. Nothing else should move in view.", flush=True)
+    pc = ledrx.PhaseCorrelator()
+    ts, shifts = [], []
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        req = cam.capture_request()
+        try:
+            t = req.get_metadata()["SensorTimestamp"] / 1e6
+            with MappedArray(req, "main") as m:
+                got = pc.update(m.array)
+        finally:
+            req.release()
+        ts.append(t)
+        shifts.append((got[0], got[1]) if got and got[2] > 0.2 else (float("nan"), float("nan")))
+    fx = (W / 2) / np.tan(np.radians(hfov) / 2)
+    res = ledrx.fit_calibration(ts, shifts, fc, fx)
+    if res is None:
+        print("Not enough usable frames (no detail in the scene, or no gyro data).")
+        return
+    mount = format_mount(res.mount)
+    print(f"gyro vs image agreement {res.corr:.2f} (1.0 = perfect; below ~0.7 do not trust it), {res.n} frames")
+    print(f"  mount {mount}, latency {res.latency_ms:.0f} ms")
+    print(f"  image/gyro motion scale {res.scale:.2f}" + ("" if 0.85 < res.scale < 1.15 else
+          f" (far from 1.0: try --hfov {2 * np.degrees(np.arctan(np.tan(np.radians(hfov) / 2) / max(res.scale, 1e-3))):.0f})"))
+    if res.corr >= 0.7:
+        MOUNT_FILE.write_text(json.dumps({"mount": mount, "latency_ms": res.latency_ms, "corr": round(res.corr, 3),
+                                          "scale": round(res.scale, 3)}, indent=1))
+        print(f"saved to {MOUNT_FILE}")
+    else:
+        print("not saved (agreement too low); move the camera more, in front of a scene with more detail")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0 = until Ctrl+C)")
@@ -226,6 +281,12 @@ def main():
     ap.add_argument("--port", type=int, default=8000, help="web preview port (0 = off)")
     ap.add_argument("--no-flip", action="store_true")
     ap.add_argument("--root", default=str(Path.home() / "recordings"))
+    ap.add_argument("--motion-comp", action="store_true", help="camera motion from the image when there is no gyro")
+    ap.add_argument("--fc", nargs="?", const="auto", metavar="PORT", help="flight controller port (default: /dev/ttyACM*)")
+    ap.add_argument("--fc-mount", help="camera axes from FC axes, e.g. x=+pitch,y=+yaw,z=+roll (default: fc_mount.json)")
+    ap.add_argument("--fc-latency", type=float, help="image delay behind the gyro [ms] (default: fc_mount.json)")
+    ap.add_argument("--fc-calibrate", type=float, metavar="SECONDS", help="find the FC mounting and latency, then exit")
+    ap.add_argument("--hfov", type=float, default=65.0, help="horizontal field of view [deg]")
     args = ap.parse_args()
 
     # Background jobs start with SIGINT ignored; make Ctrl+C and SIGTERM both stop and save.
@@ -240,6 +301,29 @@ def main():
         transform=Transform() if args.no_flip else Transform(hflip=1, vflip=1), buffer_count=8,
         controls={"FrameDurationLimits": (frame_us, frame_us)}))
     cam.start()
+
+    fc = None
+    if args.fc or args.fc_calibrate:
+        mount, latency = load_mount()
+        if args.fc_mount:
+            mount = parse_mount(args.fc_mount)
+        if args.fc_latency is not None:
+            latency = args.fc_latency
+        port = find_port() if args.fc in (None, "auto") else args.fc
+        fc = ledrx.FcTelemetry(port, 115200, mount, latency)
+        print(f"FC {fc.variant} on {port}: mount {format_mount(fc.mount)}, latency {fc.latency_ms:g} ms")
+        req = cam.capture_request()
+        lag = ledrx.monotonic_ms() - req.get_metadata()["SensorTimestamp"] / 1e6
+        req.release()
+        print(f"camera frame arrives {lag:.1f} ms after its timestamp" +
+              ("" if 0 <= lag < 200 else "  <- not the monotonic clock, gyro times will not match!"))
+    if args.fc_calibrate:
+        try:
+            calibrate(cam, fc, args.fc_calibrate, args.hfov)
+        finally:
+            fc.close()
+            cam.stop()
+        return
 
     n_ring = int(args.keep * FPS)
     status = {"fps": 0, "detect_ms": 0, "cpu": 0, "ids": [], "transmitter": transmitter, "exposure": args.exposure,
@@ -260,7 +344,8 @@ def main():
         serve(args.port, preview, status, set_exposure, lambda: clip.update(requested=True))
         print(f"preview: http://{__import__('socket').gethostname()}.local:{args.port}")
 
-    rx = ledrx.Receiver(args.chip_hz)
+    rx = ledrx.Receiver(args.chip_hz, motion_comp=args.motion_comp, hfov_deg=args.hfov)
+    prev_abs = None
     frames = np.empty((n_ring, H, W, 3), np.uint8) if n_ring else None
     ring_ts = np.full(n_ring, np.nan)
     log = deque(maxlen=max(n_ring, 1))
@@ -292,16 +377,18 @@ def main():
                 ts = req.get_metadata()["SensorTimestamp"] / 1e6
                 t_first = ts if t_first is None else t_first
                 t = ts - t_first
+                cam_rot = fc.rotation(prev_abs, ts) if fc and prev_abs is not None else None
+                prev_abs = ts
                 with MappedArray(req, "main") as m:
                     t0 = time.perf_counter()
-                    drones = rx.process(m.array, t)
+                    drones = rx.process(m.array, t, cam_rot)
                     dt = time.perf_counter() - t0
                     if n_ring and not saving():
                         frames[n % n_ring] = m.array
                         ring_ts[n % n_ring] = t
                     tracks = rx.tracks()
                     if preview and n % PREVIEW_EVERY == 0:
-                        preview.offer(m.array, tracks, drones, rx.peaks)
+                        preview.offer(m.array, tracks, drones, rx.peaks, rx.constellations())
             finally:
                 req.release()
             n += 1
@@ -310,7 +397,8 @@ def main():
             log.append({"ts": round(t, 3), "detect_ms": round(dt * 1000, 3),
                         "drones": [[d.drone_id, round(d.x, 2), round(d.y, 2), d.confirmed] for d in drones],
                         "tracks": [[k["tid"], round(k["x"], 2), round(k["y"], 2), k["drone_id"], k["id_confirmed"],
-                                    round(k["level"], 2), round(k["lo"], 2), round(k["hi"], 2)] for k in tracks]})
+                                    round(k["level"], 2), round(k["lo"], 2), round(k["hi"], 2), k["gid"]] for k in tracks],
+                        "cam_rot": None if cam_rot is None else [round(v, 7) for v in cam_rot]})
             if clip["requested"] and n_ring:
                 clip["requested"] = False
                 if not saving():
@@ -323,13 +411,18 @@ def main():
                 cpu = cpu_seconds() - sec["cpu"]
                 status.update(fps=round(sec["frames"] / wall, 1), detect_ms=round(1000 * sec["detect"] / sec["frames"], 2),
                               cpu=round(100 * cpu / wall, 1), ids=sorted(sec["ids"]))
+                if fc:
+                    status["transmitter"] = f"FC {fc.variant} {fc.rate_hz:.0f} Hz, gyro errors {fc.errors}"
                 print(f"{status['fps']:5.1f} fps  detect {status['detect_ms']:4.2f} ms  "
-                      f"process CPU {status['cpu']:5.1f}% of one core  IDs: {' '.join(status['ids']) or '-'}", flush=True)
+                      f"process CPU {status['cpu']:5.1f}% of one core  IDs: {' '.join(status['ids']) or '-'}"
+                      + (f"  FC {fc.rate_hz:.0f} Hz" if fc else ""), flush=True)
                 sec = {"frames": 0, "detect": 0.0, "wall": time.perf_counter(), "cpu": cpu_seconds(), "ids": set()}
     except KeyboardInterrupt:
         pass
     finally:
         cam.stop()
+        if fc:
+            fc.close()
     if saving():
         clip["thread"].join()
     if n_ring:

@@ -1,6 +1,6 @@
 // Decode LED IDs from a station recording (raw.avi + ts.npy + info.json).
 //
-//   ledrx_rec REC_DIR [--chip-hz 20] [--pace] [--dump frames.jsonl] [--out result.json]
+//   ledrx_rec REC_DIR [--chip-hz 20] [--pace] [--motion-comp] [--dump frames.jsonl] [--out result.json]
 //
 // --pace feeds frames at their recorded timestamps, like a live camera, so the reported CPU
 // load is what real-time decoding costs.
@@ -95,7 +95,7 @@ double pct(std::vector<double> v, double q) {
 }
 
 int usage() {
-    std::cerr << "usage: ledrx_rec REC_DIR [--chip-hz HZ] [--pace] [--dump FRAMES.jsonl] [--out RESULT.json]\n";
+    std::cerr << "usage: ledrx_rec REC_DIR [--chip-hz HZ] [--pace] [--motion-comp] [--dump FRAMES.jsonl] [--out RESULT.json]\n";
     return 2;
 }
 
@@ -110,6 +110,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--chip-hz" && i + 1 < argc) cfg.chip_hz = std::stod(argv[++i]);
         else if (a == "--pace") pace = true;
+        else if (a == "--motion-comp") cfg.motion_comp = true;
         else if (a == "--dump" && i + 1 < argc) dump_path = argv[++i];
         else if (a == "--out" && i + 1 < argc) out_path = argv[++i];
         else return usage();
